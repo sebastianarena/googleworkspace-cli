@@ -16,6 +16,8 @@ use super::Helper;
 use crate::auth;
 use crate::error::GwsError;
 use crate::executor;
+use chrono::{DateTime, Utc};
+use chrono_tz::Tz;
 use clap::{Arg, ArgAction, ArgMatches, Command};
 use serde_json::json;
 use serde_json::Value;
@@ -223,9 +225,6 @@ async fn handle_agenda(matches: &ArgMatches) -> Result<(), GwsError> {
 
     // Determine time range using the account timezone so that --today and
     // --tomorrow align with the user's Google account day, not the machine.
-    let now_in_tz = chrono::Utc::now().with_timezone(&tz);
-    let today_start_tz = crate::timezone::start_of_today(tz)?;
-
     let days: i64 = if matches.get_flag("tomorrow") {
         1
     } else if matches.get_flag("week") {
@@ -236,21 +235,14 @@ async fn handle_agenda(matches: &ArgMatches) -> Result<(), GwsError> {
             .and_then(|s| s.parse::<i64>().ok())
             .unwrap_or(1)
     };
-
-    let (time_min_dt, time_max_dt) = if matches.get_flag("today") {
-        // Today: account tz midnight to midnight+1
-        let end = today_start_tz + chrono::Duration::days(1);
-        (today_start_tz, end)
+    let range = if matches.get_flag("today") {
+        AgendaRange::Today
     } else if matches.get_flag("tomorrow") {
-        // Tomorrow: account tz midnight+1 to midnight+2
-        let start = today_start_tz + chrono::Duration::days(1);
-        let end = today_start_tz + chrono::Duration::days(2);
-        (start, end)
+        AgendaRange::Tomorrow
     } else {
-        // From now, N days ahead
-        let end = now_in_tz + chrono::Duration::days(days);
-        (now_in_tz, end)
+        AgendaRange::Days(days)
     };
+    let (time_min_dt, time_max_dt) = agenda_time_range(tz, Utc::now(), range)?;
 
     let time_min = time_min_dt.to_rfc3339();
     let time_max = time_max_dt.to_rfc3339();
@@ -417,6 +409,32 @@ async fn handle_agenda(matches: &ArgMatches) -> Result<(), GwsError> {
         crate::formatter::format_value(&output, &output_format)
     );
     Ok(())
+}
+
+enum AgendaRange {
+    Today,
+    Tomorrow,
+    /// From now, N days ahead.
+    Days(i64),
+}
+
+fn agenda_time_range(
+    tz: Tz,
+    now: DateTime<Utc>,
+    range: AgendaRange,
+) -> Result<(DateTime<Tz>, DateTime<Tz>), GwsError> {
+    let now_in_tz = now.with_timezone(&tz);
+    let today = now_in_tz.date_naive();
+    match range {
+        AgendaRange::Today => crate::timezone::day_range(tz, today),
+        AgendaRange::Tomorrow => {
+            let tomorrow = today
+                .succ_opt()
+                .ok_or_else(|| GwsError::Validation(format!("Date out of range: {today}")))?;
+            crate::timezone::day_range(tz, tomorrow)
+        }
+        AgendaRange::Days(days) => Ok((now_in_tz, now_in_tz + chrono::Duration::days(days))),
+    }
 }
 
 fn build_insert_request(
@@ -736,6 +754,59 @@ mod tests {
         assert!(body.contains("Discuss stuff"));
         assert!(body.contains("a@b.com"));
         assert!(body.contains("c@d.com"));
+    }
+
+    fn agenda_range_at(range: AgendaRange, now: &str) -> (String, String) {
+        let now = chrono::DateTime::parse_from_rfc3339(now)
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let (min, max) = agenda_time_range(chrono_tz::America::Denver, now, range).unwrap();
+        (min.to_rfc3339(), max.to_rfc3339())
+    }
+
+    #[test]
+    fn agenda_today_covers_whole_dst_day() {
+        // 25-hour day (fall back)
+        assert_eq!(
+            agenda_range_at(AgendaRange::Today, "2026-11-01T12:00:00-07:00"),
+            (
+                "2026-11-01T00:00:00-06:00".to_string(),
+                "2026-11-02T00:00:00-07:00".to_string()
+            )
+        );
+        // 23-hour day (spring forward)
+        assert_eq!(
+            agenda_range_at(AgendaRange::Today, "2026-03-08T12:00:00-06:00"),
+            (
+                "2026-03-08T00:00:00-07:00".to_string(),
+                "2026-03-09T00:00:00-06:00".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn agenda_tomorrow_next_to_dst_day() {
+        assert_eq!(
+            agenda_range_at(AgendaRange::Tomorrow, "2026-10-31T12:00:00-06:00"),
+            (
+                "2026-11-01T00:00:00-06:00".to_string(),
+                "2026-11-02T00:00:00-07:00".to_string()
+            )
+        );
+        assert_eq!(
+            agenda_range_at(AgendaRange::Tomorrow, "2026-11-01T12:00:00-07:00"),
+            (
+                "2026-11-02T00:00:00-07:00".to_string(),
+                "2026-11-03T00:00:00-07:00".to_string()
+            )
+        );
+        assert_eq!(
+            agenda_range_at(AgendaRange::Tomorrow, "2026-03-08T12:00:00-06:00"),
+            (
+                "2026-03-09T00:00:00-06:00".to_string(),
+                "2026-03-10T00:00:00-06:00".to_string()
+            )
+        );
     }
 
     /// Verify that agenda day boundaries use a specific timezone, not UTC.

@@ -182,11 +182,6 @@ pub async fn resolve_account_timezone(
     Ok(tz)
 }
 
-/// Return the start of today in the given timezone. See [`start_of_day`].
-pub fn start_of_today(tz: Tz) -> Result<chrono::DateTime<Tz>, crate::error::GwsError> {
-    start_of_day(tz, chrono::Utc::now().with_timezone(&tz).date_naive())
-}
-
 /// Return the first instant of `date` in `tz`. That is local midnight,
 /// except where a DST change skips midnight (e.g. America/Santiago), in
 /// which case it is the first local time that exists on that day.
@@ -206,6 +201,18 @@ pub fn start_of_day(
                 tz
             ))
         })
+}
+
+/// Return `[start, end)` of `date` in `tz`: from its first instant to the
+/// first instant of the next date.
+pub fn day_range(
+    tz: Tz,
+    date: chrono::NaiveDate,
+) -> Result<(chrono::DateTime<Tz>, chrono::DateTime<Tz>), crate::error::GwsError> {
+    let next = date
+        .succ_opt()
+        .ok_or_else(|| crate::error::GwsError::Validation(format!("Date out of range: {date}")))?;
+    Ok((start_of_day(tz, date)?, start_of_day(tz, next)?))
 }
 
 /// Best-effort machine-local IANA timezone detection using the
@@ -273,6 +280,20 @@ mod tests {
         let date = chrono::NaiveDate::from_ymd_opt(2026, 9, 6).unwrap();
         let start = start_of_day(chrono_tz::America::Santiago, date).unwrap();
         assert_eq!(start.to_rfc3339(), "2026-09-06T01:00:00-03:00");
+    }
+
+    #[test]
+    fn day_range_spans_dst_days() {
+        let tz = chrono_tz::America::Denver;
+        let fall_back = chrono::NaiveDate::from_ymd_opt(2026, 11, 1).unwrap();
+        let (start, end) = day_range(tz, fall_back).unwrap();
+        assert_eq!(start.to_rfc3339(), "2026-11-01T00:00:00-06:00");
+        assert_eq!(end.to_rfc3339(), "2026-11-02T00:00:00-07:00");
+
+        let spring_forward = chrono::NaiveDate::from_ymd_opt(2026, 3, 8).unwrap();
+        let (start, end) = day_range(tz, spring_forward).unwrap();
+        assert_eq!(start.to_rfc3339(), "2026-03-08T00:00:00-07:00");
+        assert_eq!(end.to_rfc3339(), "2026-03-09T00:00:00-06:00");
     }
 
     #[test]

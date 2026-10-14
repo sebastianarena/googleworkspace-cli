@@ -279,8 +279,7 @@ async fn handle_standup_report(matches: &ArgMatches) -> Result<(), GwsError> {
     // Resolve account timezone for day boundaries
     let tz = crate::timezone::resolve_account_timezone(&client, &token, None).await?;
     let now_in_tz = chrono::Utc::now().with_timezone(&tz);
-    let today_start_tz = crate::timezone::start_of_today(tz)?;
-    let today_end_tz = today_start_tz + chrono::Duration::days(1);
+    let (today_start_tz, today_end_tz) = crate::timezone::day_range(tz, now_in_tz.date_naive())?;
     let time_min = today_start_tz.to_rfc3339();
     let time_max = today_end_tz.to_rfc3339();
 

@@ -58,7 +58,7 @@ pub(super) struct SendConfig {
 fn create_send_raw_message(config: &SendConfig) -> Result<String, GwsError> {
     let mb = mail_builder::MessageBuilder::new()
         .to(to_mb_address_list(&config.to))
-        .subject(&config.subject);
+        .subject(sanitize_header_text(&config.subject));
 
     let mb = apply_optional_headers(
         mb,
@@ -240,6 +240,27 @@ mod tests {
         assert!(
             err.to_string().contains("--to"),
             "error should mention --to"
+        );
+    }
+
+    #[test]
+    fn test_send_subject_newlines_cannot_inject_headers() {
+        let config = SendConfig {
+            to: Mailbox::parse_list("bob@example.com"),
+            subject: "Hello\r\nBcc: eve@example.com\nX-Evil:\tyes".to_string(),
+            body: "Body".to_string(),
+            from: None,
+            cc: None,
+            bcc: None,
+            html: false,
+            attachments: vec![],
+        };
+        let raw = create_send_raw_message(&config).unwrap();
+        assert!(extract_header(&raw, "Bcc").is_none(), "{raw}");
+        assert!(extract_header(&raw, "X-Evil").is_none(), "{raw}");
+        assert_eq!(
+            extract_header(&raw, "Subject").unwrap(),
+            "Hello Bcc: eve@example.com X-Evil: yes"
         );
     }
 

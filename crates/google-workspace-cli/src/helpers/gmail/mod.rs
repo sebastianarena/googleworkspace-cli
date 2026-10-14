@@ -60,6 +60,26 @@ fn sanitize_control_chars(s: &str) -> String {
     s.chars().filter(|c| !c.is_ascii_control()).collect()
 }
 
+/// Make a free-text header value (the Subject) single-line: each run of
+/// control characters becomes one space. mail-builder writes such values
+/// raw, so a CR/LF would otherwise start a new header (e.g. `Bcc:`).
+pub(super) fn sanitize_header_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut in_control = false;
+    for c in s.chars() {
+        if c.is_control() {
+            if !in_control {
+                out.push(' ');
+            }
+            in_control = true;
+        } else {
+            out.push(c);
+            in_control = false;
+        }
+    }
+    out
+}
+
 /// A parsed RFC 5322 mailbox: optional display name + email address.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 pub(super) struct Mailbox {

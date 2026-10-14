@@ -151,7 +151,7 @@ fn create_forward_raw_message(
 ) -> Result<String, GwsError> {
     let mb = mail_builder::MessageBuilder::new()
         .to(to_mb_address_list(envelope.to))
-        .subject(envelope.subject);
+        .subject(sanitize_header_text(envelope.subject));
 
     let mb = apply_optional_headers(mb, envelope.from, envelope.cc, envelope.bcc);
     let mb = set_threading_headers(mb, &envelope.threading);
@@ -345,6 +345,39 @@ mod tests {
     #[test]
     fn test_build_forward_subject_case_insensitive() {
         assert_eq!(build_forward_subject("FWD: Hello"), "FWD: Hello");
+    }
+
+    #[test]
+    fn test_forward_subject_newlines_cannot_inject_headers() {
+        let original = OriginalMessage {
+            message_id: "abc@example.com".to_string(),
+            from: Mailbox::parse("alice@example.com"),
+            subject: "Hello\r\nBcc: eve@example.com".to_string(),
+            body_text: "Original content".to_string(),
+            ..Default::default()
+        };
+        let subject = build_forward_subject(&original.subject);
+        let refs = build_references_chain(&original);
+        let to = Mailbox::parse_list("dave@example.com");
+        let envelope = ForwardEnvelope {
+            to: &to,
+            cc: None,
+            bcc: None,
+            from: None,
+            subject: &subject,
+            body: None,
+            html: false,
+            threading: ThreadingHeaders {
+                in_reply_to: &original.message_id,
+                references: &refs,
+            },
+        };
+        let raw = create_forward_raw_message(&envelope, &original, &[]).unwrap();
+        assert!(extract_header(&raw, "Bcc").is_none(), "{raw}");
+        assert_eq!(
+            extract_header(&raw, "Subject").unwrap(),
+            "Fwd: Hello Bcc: eve@example.com"
+        );
     }
 
     #[test]

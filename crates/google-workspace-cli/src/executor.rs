@@ -19,7 +19,7 @@
 //! error mapping, and optionally running text content through Model Armor for sanitization.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use futures_util::stream::TryStreamExt;
@@ -357,6 +357,42 @@ async fn handle_json_response(
     Ok(false)
 }
 
+/// Create `download.<ext>` in `dir`, or `download-N.<ext>` if that name is
+/// taken, so an earlier download is never overwritten.
+async fn create_download_file(
+    dir: &Path,
+    ext: &str,
+) -> Result<(tokio::fs::File, PathBuf), GwsError> {
+    for n in 0..1000u32 {
+        let name = if n == 0 {
+            format!("download.{ext}")
+        } else {
+            format!("download-{n}.{ext}")
+        };
+        let path = dir.join(name);
+        match tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .await
+        {
+            Ok(file) => {
+                let shown = path.strip_prefix(".").map(PathBuf::from).unwrap_or(path);
+                return Ok((file, shown));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => {
+                return Err(GwsError::Other(
+                    anyhow::Error::new(e).context("Failed to create output file"),
+                ))
+            }
+        }
+    }
+    Err(GwsError::Other(anyhow::anyhow!(
+        "Too many existing download.{ext} files; pass --output to choose a file name"
+    )))
+}
+
 /// Handle a binary response by streaming it to a file.
 async fn handle_binary_response(
     response: reqwest::Response,
@@ -365,16 +401,15 @@ async fn handle_binary_response(
     output_format: &crate::formatter::OutputFormat,
     capture_output: bool,
 ) -> Result<Option<Value>, GwsError> {
-    let file_path = if let Some(p) = output_path {
-        PathBuf::from(p)
+    let (mut file, file_path) = if let Some(p) = output_path {
+        let path = PathBuf::from(p);
+        let file = tokio::fs::File::create(&path)
+            .await
+            .context("Failed to create output file")?;
+        (file, path)
     } else {
-        let ext = mime_to_extension(content_type);
-        PathBuf::from(format!("download.{ext}"))
+        create_download_file(Path::new("."), mime_to_extension(content_type)).await?
     };
-
-    let mut file = tokio::fs::File::create(&file_path)
-        .await
-        .context("Failed to create output file")?;
 
     let mut stream = response.bytes_stream();
     let mut total_bytes: u64 = 0;
@@ -1181,7 +1216,24 @@ fn get_value_type(val: &Value) -> &'static str {
 
 /// Maps a MIME type to a file extension.
 pub fn mime_to_extension(mime: &str) -> &str {
-    if mime.contains("pdf") {
+    // Office and OpenDocument types first: their MIME types also contain
+    // "xml" (openxmlformats) or "document" (officedocument, opendocument).
+    if mime.contains("opendocument.spreadsheet") {
+        "ods"
+    } else if mime.contains("opendocument.text") {
+        "odt"
+    } else if mime.contains("opendocument.presentation") {
+        "odp"
+    } else if mime.contains("spreadsheet") || mime.contains("xlsx") {
+        "xlsx"
+    } else if mime.contains("presentation") || mime.contains("pptx") {
+        "pptx"
+    } else if mime.contains("wordprocessing")
+        || mime.contains("google-apps.document")
+        || mime.contains("docx")
+    {
+        "docx"
+    } else if mime.contains("pdf") {
         "pdf"
     } else if mime.contains("png") {
         "png"
@@ -1201,12 +1253,8 @@ pub fn mime_to_extension(mime: &str) -> &str {
         "txt"
     } else if mime.contains("octet-stream") {
         "bin"
-    } else if mime.contains("spreadsheet") || mime.contains("xlsx") {
-        "xlsx"
-    } else if mime.contains("document") || mime.contains("docx") {
+    } else if mime.contains("document") {
         "docx"
-    } else if mime.contains("presentation") || mime.contains("pptx") {
-        "pptx"
     } else if mime.contains("script") {
         "json"
     } else {
@@ -1252,6 +1300,54 @@ mod tests {
         assert_eq!(
             mime_to_extension("application/vnd.google-apps.presentation"),
             "pptx"
+        );
+    }
+
+    #[test]
+    fn test_mime_to_extension_office_exports() {
+        let office = "application/vnd.openxmlformats-officedocument";
+        assert_eq!(
+            mime_to_extension(&format!("{office}.spreadsheetml.sheet")),
+            "xlsx"
+        );
+        assert_eq!(
+            mime_to_extension(&format!("{office}.wordprocessingml.document")),
+            "docx"
+        );
+        assert_eq!(
+            mime_to_extension(&format!("{office}.presentationml.presentation")),
+            "pptx"
+        );
+        assert_eq!(
+            mime_to_extension("application/vnd.oasis.opendocument.spreadsheet"),
+            "ods"
+        );
+        assert_eq!(
+            mime_to_extension("application/vnd.oasis.opendocument.text"),
+            "odt"
+        );
+        assert_eq!(
+            mime_to_extension("application/vnd.google-apps.document"),
+            "docx"
+        );
+        assert_eq!(mime_to_extension("text/xml"), "xml");
+    }
+
+    #[tokio::test]
+    async fn test_create_download_file_never_overwrites() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("download.pdf"), b"keep").unwrap();
+
+        let (_f1, p1) = create_download_file(dir.path(), "pdf").await.unwrap();
+        assert_eq!(p1, dir.path().join("download-1.pdf"));
+        let (_f2, p2) = create_download_file(dir.path(), "pdf").await.unwrap();
+        assert_eq!(p2, dir.path().join("download-2.pdf"));
+        let (_f3, p3) = create_download_file(dir.path(), "csv").await.unwrap();
+        assert_eq!(p3, dir.path().join("download.csv"));
+
+        assert_eq!(
+            std::fs::read(dir.path().join("download.pdf")).unwrap(),
+            b"keep"
         );
     }
 

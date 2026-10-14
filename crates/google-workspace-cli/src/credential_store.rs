@@ -379,7 +379,17 @@ fn get_or_create_key() -> anyhow::Result<[u8; 32]> {
         .or_else(|_| std::env::var("USERNAME"))
         .unwrap_or_else(|_| "unknown-user".to_string());
 
+    #[cfg(not(test))]
     let key_file = crate::auth_commands::config_dir().join(".encryption_key");
+    // Tests get one key file per process, outside the user's real config dir.
+    // config_dir() follows an env var that parallel tests point at temp dirs
+    // they later delete, which made key creation fail intermittently.
+    #[cfg(test)]
+    let key_file = {
+        let dir = std::env::temp_dir().join(format!("gws-test-key-{}", std::process::id()));
+        std::fs::create_dir_all(&dir)?;
+        dir.join(".encryption_key")
+    };
     let provider = OsKeyring::new("gws-cli", &username);
 
     let key = resolve_key(backend, &provider, &key_file)?;

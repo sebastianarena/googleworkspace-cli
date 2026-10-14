@@ -240,6 +240,25 @@ async fn build_http_request(
     Ok(request)
 }
 
+#[derive(Debug, PartialEq)]
+enum NextPage {
+    Fetch(String),
+    LimitReached,
+    Done,
+}
+
+/// Decide whether `--page-all` should fetch another page after this one.
+fn next_page(json_val: &Value, pagination: &PaginationConfig, pages_fetched: u32) -> NextPage {
+    if !pagination.page_all {
+        return NextPage::Done;
+    }
+    match json_val.get("nextPageToken").and_then(|v| v.as_str()) {
+        Some(token) if pages_fetched < pagination.page_limit => NextPage::Fetch(token.to_string()),
+        Some(_) => NextPage::LimitReached,
+        None => NextPage::Done,
+    }
+}
+
 /// Handle a JSON response: parse, sanitize via Model Armor, output, and check pagination.
 /// Returns `Ok(true)` if the pagination loop should continue.
 #[allow(clippy::too_many_arguments)]
@@ -313,20 +332,23 @@ async fn handle_json_response(
             );
         }
 
-        // Check for nextPageToken to continue pagination
-        if pagination.page_all {
-            if let Some(next_token) = json_val.get("nextPageToken").and_then(|v| v.as_str()) {
-                if *pages_fetched < pagination.page_limit {
-                    *page_token = Some(next_token.to_string());
-                    if pagination.page_delay_ms > 0 {
-                        tokio::time::sleep(std::time::Duration::from_millis(
-                            pagination.page_delay_ms,
-                        ))
+        match next_page(&json_val, pagination, *pages_fetched) {
+            NextPage::Fetch(next_token) => {
+                *page_token = Some(next_token);
+                if pagination.page_delay_ms > 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(pagination.page_delay_ms))
                         .await;
-                    }
-                    return Ok(true); // continue paginating
                 }
+                return Ok(true); // continue paginating
             }
+            NextPage::LimitReached => {
+                eprintln!(
+                    "⚠️  Stopped after {} pages (--page-limit); more results are available. \
+                     Raise --page-limit to fetch them.",
+                    pagination.page_limit
+                );
+            }
+            NextPage::Done => {}
         }
     } else {
         // Not valid JSON, output as-is
@@ -2506,4 +2528,28 @@ async fn test_page_token_replaces_user_supplied_page_token() {
         .collect();
     assert_eq!(tokens, vec!["next-token".to_string()]);
     assert!(built.url().query().unwrap().contains("pageSize=10"));
+}
+
+#[test]
+fn test_next_page_reports_limit_reached_when_token_remains() {
+    let pagination = PaginationConfig {
+        page_all: true,
+        page_limit: 2,
+        page_delay_ms: 0,
+    };
+    let with_token = json!({"files": [], "nextPageToken": "tok"});
+    let last_page = json!({"files": []});
+
+    assert_eq!(
+        next_page(&with_token, &pagination, 1),
+        NextPage::Fetch("tok".to_string())
+    );
+    assert_eq!(
+        next_page(&with_token, &pagination, 2),
+        NextPage::LimitReached
+    );
+    assert_eq!(next_page(&last_page, &pagination, 2), NextPage::Done);
+
+    let single = PaginationConfig::default();
+    assert_eq!(next_page(&with_token, &single, 1), NextPage::Done);
 }

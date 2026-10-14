@@ -16,6 +16,7 @@
 //!
 //! Transforms JSON API responses into human-readable formats (table, YAML, CSV).
 
+use crate::output::sanitize_for_terminal;
 use serde_json::Value;
 use std::fmt::Write;
 
@@ -217,8 +218,9 @@ fn format_table(value: &Value) -> String {
 fn flatten_object(obj: &serde_json::Map<String, Value>, prefix: &str) -> Vec<(String, String)> {
     let mut out = Vec::new();
     for (key, val) in obj {
+        let key = sanitize_for_terminal(key);
         let full_key = if prefix.is_empty() {
-            key.clone()
+            key
         } else {
             format!("{prefix}.{key}")
         };
@@ -513,7 +515,7 @@ fn format_csv_page(
 
     // Header (omitted on continuation pages)
     if fixed_columns.is_none() {
-        let _ = writeln!(output, "{}", columns.join(","));
+        let _ = writeln!(output, "{}", sanitize_for_terminal(&columns.join(",")));
     }
 
     // Rows
@@ -545,14 +547,16 @@ fn csv_escape(s: &str) -> String {
 fn value_to_cell(value: &Value) -> String {
     match value {
         Value::Null => String::new(),
-        Value::String(s) => s.clone(),
+        Value::String(s) => sanitize_for_terminal(s),
         Value::Bool(b) => b.to_string(),
         Value::Number(n) => n.to_string(),
         Value::Array(arr) => {
             let items: Vec<String> = arr.iter().map(value_to_cell).collect();
             items.join(", ")
         }
-        Value::Object(_) => serde_json::to_string(value).unwrap_or_default(),
+        Value::Object(_) => {
+            sanitize_for_terminal(&serde_json::to_string(value).unwrap_or_default())
+        }
     }
 }
 
@@ -864,6 +868,21 @@ mod tests {
             output.contains("body: |"),
             "multiline string must use block scalar, got:\n{output}"
         );
+    }
+
+    #[test]
+    fn test_format_table_strips_terminal_escapes() {
+        let val = json!({"files": [
+            {"name": "report\u{1b}]0;pwned\u{7}.pdf", "\u{1b}[31mkey": "x"}
+        ]});
+        for format in [OutputFormat::Table, OutputFormat::Csv] {
+            let out = format_value(&val, &format);
+            assert!(!out.contains('\u{1b}') && !out.contains('\u{7}'), "{out:?}");
+            assert!(out.contains("report]0;pwned.pdf"), "{out:?}");
+        }
+        let single = json!({"title": "a\u{1b}[2Jb"});
+        let out = format_value(&single, &OutputFormat::Table);
+        assert!(!out.contains('\u{1b}'), "{out:?}");
     }
 
     // --- Paginated format tests ---

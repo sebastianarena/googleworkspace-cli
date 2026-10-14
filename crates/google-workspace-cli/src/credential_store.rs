@@ -224,17 +224,33 @@ fn resolve_key(
                             return Ok(arr);
                         }
                     }
-                    // Keyring contained invalid data — fall through to generate new.
+                    // The entry is shared by every config dir, so overwriting it
+                    // would orphan every account's credentials. Fail instead.
+                    anyhow::bail!(
+                        "OS keyring entry holds an invalid encryption key; refusing to replace it. \
+                         Inspect or delete the 'gws-cli' keychain item to recover."
+                    );
                 }
                 Err(keyring::Error::NoEntry) => {
-                    // Keyring is empty — fall through to generate new.
+                    // Keyring is empty. A key file (left by the file backend or a
+                    // lost keychain entry) may hold the only key that decrypts
+                    // existing credentials: import it rather than generating.
+                    if let Some(key) = read_key_file(key_file) {
+                        if let Err(e) = provider.set_password(&STANDARD.encode(key)) {
+                            eprintln!(
+                                "Warning: failed to import key file into OS keyring: {}",
+                                sanitize_for_terminal(&e.to_string())
+                            );
+                        }
+                        return Ok(key);
+                    }
                 }
                 Err(e) => {
                     anyhow::bail!("OS keyring failed: {}. Set GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND=file to use file storage.", sanitize_for_terminal(&e.to_string()));
                 }
             }
 
-            // Generate a new key if keyring was empty or contained invalid data.
+            // Generate a new key: the keyring is empty and no key file exists.
             let key = generate_random_key();
             let b64_key = STANDARD.encode(key);
             if let Err(e) = provider.set_password(&b64_key) {
@@ -620,6 +636,47 @@ mod tests {
         assert!(
             !key_file.exists(),
             "Legacy file must be deleted upon successful keyring generation"
+        );
+    }
+
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    fn keyring_backend_imports_file_key_when_keyring_is_empty() {
+        // A key file left by KEYRING_BACKEND=file (or a lost keychain entry)
+        // holds the only key that decrypts existing credentials. Generating a
+        // fresh key instead would orphan them.
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        let dir = tempfile::tempdir().unwrap();
+        let key_file = dir.path().join(".encryption_key");
+        let existing = [42u8; 32];
+        std::fs::write(&key_file, STANDARD.encode(existing)).unwrap();
+
+        let mock = MockKeyring::no_entry();
+        let result = resolve_key(KeyringBackend::Keyring, &mock, &key_file).unwrap();
+
+        assert_eq!(result, existing, "must reuse the key file, not generate");
+        assert_eq!(
+            mock.last_set.borrow().as_deref(),
+            Some(STANDARD.encode(existing).as_str()),
+            "the file key must be imported into the keyring"
+        );
+    }
+
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    fn keyring_backend_refuses_to_overwrite_invalid_keyring_data() {
+        // The keychain entry is shared by every config dir. Replacing it with a
+        // new key would make every account's credentials undecryptable.
+        let dir = tempfile::tempdir().unwrap();
+        let key_file = dir.path().join(".encryption_key");
+
+        let mock = MockKeyring::with_password("not-a-valid-key");
+        let result = resolve_key(KeyringBackend::Keyring, &mock, &key_file);
+
+        assert!(result.is_err(), "invalid keyring data must be an error");
+        assert!(
+            mock.last_set.borrow().is_none(),
+            "the keyring entry must not be overwritten"
         );
     }
 

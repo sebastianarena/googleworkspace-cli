@@ -85,7 +85,9 @@ async fn refresh_token_with_reqwest(
 /// Priority:
 /// 1. `GOOGLE_WORKSPACE_PROJECT_ID` environment variable.
 /// 2. `project_id` from the OAuth client configuration (`client_secret.json`).
-/// 3. `quota_project_id` from Application Default Credentials (ADC).
+///
+/// ADC's `quota_project_id` is deliberately not used: ADC is machine-global, so
+/// it would apply one project to every config dir (account).
 pub fn get_quota_project() -> Option<String> {
     // 1. Explicit environment variable (highest priority)
     if let Ok(project_id) = std::env::var("GOOGLE_WORKSPACE_PROJECT_ID") {
@@ -101,16 +103,7 @@ pub fn get_quota_project() -> Option<String> {
         }
     }
 
-    // 3. Fallback to Application Default Credentials (ADC)
-    let path = std::env::var("GOOGLE_APPLICATION_CREDENTIALS")
-        .ok()
-        .map(PathBuf::from)
-        .or_else(adc_well_known_path)?;
-    let content = std::fs::read_to_string(path).ok()?;
-    let json: serde_json::Value = serde_json::from_str(&content).ok()?;
-    json.get("quota_project_id")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
+    None
 }
 
 /// Returns the well-known Application Default Credentials path:
@@ -952,7 +945,9 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn test_get_quota_project_priority_adc_fallback() {
+    fn test_get_quota_project_ignores_adc() {
+        // ADC is machine-global, not per config dir: honouring its quota project
+        // would bill (and 403) every account against one project.
         let tmp = tempfile::tempdir().unwrap();
         let adc_dir = tmp.path().join(".config").join("gcloud");
         std::fs::create_dir_all(&adc_dir).unwrap();
@@ -964,30 +959,12 @@ mod tests {
 
         let _home_guard = EnvVarGuard::set("HOME", tmp.path());
         let _env_guard = EnvVarGuard::remove("GOOGLE_WORKSPACE_PROJECT_ID");
-        let _config_guard = EnvVarGuard::remove("GOOGLE_WORKSPACE_CLI_CONFIG_DIR");
+        let _config_guard = EnvVarGuard::set(
+            "GOOGLE_WORKSPACE_CLI_CONFIG_DIR",
+            tmp.path().join("gws").to_str().unwrap(),
+        );
         let _adc_guard = EnvVarGuard::remove("GOOGLE_APPLICATION_CREDENTIALS");
 
-        assert_eq!(get_quota_project(), Some("adc-project".to_string()));
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn test_get_quota_project_reads_adc() {
-        let tmp = tempfile::tempdir().unwrap();
-        let adc_dir = tmp.path().join(".config").join("gcloud");
-        std::fs::create_dir_all(&adc_dir).unwrap();
-        std::fs::write(
-            adc_dir.join("application_default_credentials.json"),
-            r#"{"quota_project_id": "my-project-123"}"#,
-        )
-        .unwrap();
-
-        let _home_guard = EnvVarGuard::set("HOME", tmp.path());
-        let _adc_guard = EnvVarGuard::remove("GOOGLE_APPLICATION_CREDENTIALS");
-        // Isolate from local environment
-        let _env_guard = EnvVarGuard::remove("GOOGLE_WORKSPACE_PROJECT_ID");
-        let _config_guard = EnvVarGuard::remove("GOOGLE_WORKSPACE_CLI_CONFIG_DIR");
-
-        assert_eq!(get_quota_project(), Some("my-project-123".to_string()));
+        assert_eq!(get_quota_project(), None);
     }
 }

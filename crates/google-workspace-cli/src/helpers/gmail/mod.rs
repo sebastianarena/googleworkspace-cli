@@ -614,6 +614,35 @@ fn resolve_sender_from_identities(
     }
 }
 
+/// Check that every `--from` address is one of the account's send-as
+/// identities; Gmail would otherwise rewrite or reject the From header.
+fn validate_from_identities(
+    from: &[Mailbox],
+    identities: &[SendAsIdentity],
+) -> Result<(), GwsError> {
+    let unknown: Vec<&str> = from
+        .iter()
+        .filter(|m| {
+            !identities
+                .iter()
+                .any(|id| id.mailbox.email.eq_ignore_ascii_case(&m.email))
+        })
+        .map(|m| m.email.as_str())
+        .collect();
+    if unknown.is_empty() {
+        return Ok(());
+    }
+    let known: Vec<&str> = identities
+        .iter()
+        .map(|id| id.mailbox.email.as_str())
+        .collect();
+    Err(GwsError::Validation(format!(
+        "--from {} is not a send-as address of this account (send-as addresses: {})",
+        sanitize_for_terminal(&unknown.join(", ")),
+        sanitize_for_terminal(&known.join(", ")),
+    )))
+}
+
 fn uses_env_access_token() -> bool {
     std::env::var_os("GOOGLE_WORKSPACE_CLI_TOKEN").is_some_and(|token| !token.is_empty())
 }
@@ -628,7 +657,8 @@ fn profile_scope_tip(using_env_token: bool) -> &'static str {
 
 /// Resolve the `From` address using Gmail send-as identities.
 ///
-/// Fetches send-as settings and enriches the From address with the display name.
+/// Fetches send-as settings, rejects a `from` address that is not a send-as
+/// identity, and enriches the From address with the display name.
 /// Degrades gracefully if the API call fails — returns the original `from`
 /// addresses unchanged (without display name enrichment), or `Ok(None)` if
 /// `from` was not provided.
@@ -642,18 +672,11 @@ pub(super) async fn resolve_sender(
     token: &str,
     from: Option<&[Mailbox]>,
 ) -> Result<Option<Vec<Mailbox>>, GwsError> {
-    // All provided mailboxes already have display names — skip API call.
-    if let Some(addrs) = from {
-        if addrs.iter().all(|m| m.name.is_some()) {
-            return Ok(Some(addrs.to_vec()));
-        }
-    }
-
     let identities = match fetch_send_as_identities(client, token).await {
         Ok(ids) => ids,
         Err(e) => {
             let hint = if from.is_some() {
-                "proceeding with email-only From header"
+                "proceeding with an unverified --from"
             } else {
                 "Gmail will use your default address"
             };
@@ -665,6 +688,9 @@ pub(super) async fn resolve_sender(
         }
     };
 
+    if let Some(addrs) = from {
+        validate_from_identities(addrs, &identities)?;
+    }
     let mut result = resolve_sender_from_identities(from, &identities);
 
     // When the resolved identity has no display name (common for Workspace accounts
@@ -3641,6 +3667,29 @@ mod tests {
         assert_eq!(addrs[0].name.as_deref(), Some("Custom"));
         // Second was bare — enriched from send-as list
         assert_eq!(addrs[1].name.as_deref(), Some("Malo (Work)"));
+    }
+
+    #[test]
+    fn test_validate_from_accepts_send_as_addresses() {
+        let ids = make_identities();
+        let from = [
+            Mailbox::parse("Custom Name <MALO@work.com>"),
+            Mailbox::parse("malo@intelligence.org"),
+        ];
+        assert!(validate_from_identities(&from, &ids).is_ok());
+    }
+
+    #[test]
+    fn test_validate_from_rejects_unknown_address() {
+        let ids = make_identities();
+        for raw in ["unknown@example.com", "Alice <unknown@example.com>"] {
+            let from = [Mailbox::parse(raw)];
+            let err = validate_from_identities(&from, &ids).unwrap_err();
+            assert!(matches!(err, GwsError::Validation(_)), "{err}");
+            let msg = err.to_string();
+            assert!(msg.contains("unknown@example.com"), "{msg}");
+            assert!(msg.contains("malo@work.com"), "{msg}");
+        }
     }
 
     #[test]

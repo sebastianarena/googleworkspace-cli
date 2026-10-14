@@ -860,6 +860,20 @@ fn content_type_charset(content_type: &str) -> Option<&str> {
     })
 }
 
+/// Append a decoded body piece, separating it from earlier pieces by a newline.
+fn append_body(body: &mut Option<String>, piece: Option<String>) {
+    let Some(piece) = piece else { return };
+    match body {
+        Some(existing) => {
+            if !existing.ends_with('\n') {
+                existing.push('\n');
+            }
+            existing.push_str(&piece);
+        }
+        None => *body = Some(piece),
+    }
+}
+
 /// Synthesize a filename from the part index and MIME type when no filename is present.
 /// e.g., `"image/png"` at index 1 → `"part-1.png"`.
 fn synthesize_filename(part_index: usize, mime_type: &str) -> String {
@@ -955,10 +969,11 @@ fn extract_payload_recursive(
         // body_data is guaranteed Some by the is_body_text_part check above.
         let data = body_data.unwrap();
         let content_type = get_part_header(part, "Content-Type");
-        if mime_type == "text/plain" && contents.body_text.is_none() {
-            contents.body_text = decode_text_body(data, "text/plain", content_type);
-        } else if mime_type == "text/html" && contents.body_html.is_none() {
-            contents.body_html = decode_text_body(data, "text/html", content_type);
+        let decoded = decode_text_body(data, mime_type, content_type);
+        if mime_type == "text/plain" {
+            append_body(&mut contents.body_text, decoded);
+        } else {
+            append_body(&mut contents.body_html, decoded);
         }
     } else if is_hydratable {
         // This part has fetchable data — classify as inline or attachment
@@ -1011,8 +1026,26 @@ fn extract_payload_recursive(
     } else {
         // Only recurse into non-hydratable container nodes (multipart/mixed, etc.)
         if let Some(child_parts) = part.get("parts").and_then(|p| p.as_array()) {
-            for child in child_parts {
-                extract_payload_recursive(child, contents, part_counter);
+            if mime_type.eq_ignore_ascii_case("multipart/alternative") {
+                // Children are alternative renderings of the same body: keep the
+                // first of each type rather than joining them.
+                let mut chosen = PayloadContents::default();
+                for child in child_parts {
+                    let mut alt = PayloadContents::default();
+                    extract_payload_recursive(child, &mut alt, part_counter);
+                    chosen.body_text = chosen.body_text.or(alt.body_text);
+                    chosen.body_html = chosen.body_html.or(alt.body_html);
+                    chosen.parts.extend(alt.parts);
+                }
+                append_body(&mut contents.body_text, chosen.body_text);
+                append_body(&mut contents.body_html, chosen.body_html);
+                contents.parts.extend(chosen.parts);
+            } else {
+                // Sibling text parts (e.g. text, attachment, text in
+                // multipart/mixed) are consecutive pieces of one body.
+                for child in child_parts {
+                    extract_payload_recursive(child, contents, part_counter);
+                }
             }
         } else if body_data.is_some() && !mime_type.starts_with("multipart/") {
             // Non-body-text, non-hydratable leaf with inline data that we're about
@@ -3621,6 +3654,62 @@ mod tests {
             extract_plain_text_body(&payload).as_deref(),
             Some("Caf\u{fffd} meeting")
         );
+    }
+
+    #[test]
+    fn test_extract_payload_contents_concatenates_text_around_attachment() {
+        // Apple Mail puts an attachment between two text parts of a
+        // multipart/mixed message; both halves of the body must survive.
+        let payload = json!({
+            "mimeType": "multipart/mixed",
+            "parts": [
+                { "mimeType": "text/plain", "body": { "data": base64url("Hello Bob,\nsee attached.") } },
+                {
+                    "mimeType": "application/pdf",
+                    "filename": "report.pdf",
+                    "body": { "attachmentId": "ATT1", "size": 100 }
+                },
+                { "mimeType": "text/plain", "body": { "data": base64url("Thanks,\nAlice") } }
+            ]
+        });
+        let contents = extract_payload_contents(&payload);
+        assert_eq!(
+            contents.body_text.as_deref(),
+            Some("Hello Bob,\nsee attached.\nThanks,\nAlice")
+        );
+        assert_eq!(contents.parts.len(), 1);
+    }
+
+    #[test]
+    fn test_extract_payload_contents_concatenates_html_inside_alternative() {
+        // multipart/alternative picks one version of each type, but text parts
+        // split around an attachment inside one alternative are joined.
+        let payload = json!({
+            "mimeType": "multipart/alternative",
+            "parts": [
+                { "mimeType": "text/plain", "body": { "data": base64url("Plain version") } },
+                {
+                    "mimeType": "multipart/mixed",
+                    "parts": [
+                        { "mimeType": "text/html", "body": { "data": base64url("<p>Part one</p>") } },
+                        {
+                            "mimeType": "image/png",
+                            "filename": "chart.png",
+                            "body": { "attachmentId": "IMG1", "size": 10 }
+                        },
+                        { "mimeType": "text/html", "body": { "data": base64url("<p>Part two</p>") } },
+                        { "mimeType": "text/plain", "body": { "data": base64url("Ignored plain") } }
+                    ]
+                }
+            ]
+        });
+        let contents = extract_payload_contents(&payload);
+        assert_eq!(contents.body_text.as_deref(), Some("Plain version"));
+        assert_eq!(
+            contents.body_html.as_deref(),
+            Some("<p>Part one</p>\n<p>Part two</p>")
+        );
+        assert_eq!(contents.parts.len(), 1);
     }
 
     #[test]

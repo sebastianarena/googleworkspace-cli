@@ -251,28 +251,14 @@ async fn handle_agenda(matches: &ArgMatches) -> Result<(), GwsError> {
     let calendar_filter = matches.get_one::<String>("calendar");
 
     // 1. List all calendars
-    let list_url = "https://www.googleapis.com/calendar/v3/users/me/calendarList";
-    let list_resp = client
-        .get(list_url)
-        .bearer_auth(&token)
-        .send()
-        .await
-        .map_err(|e| GwsError::Other(anyhow::anyhow!("Failed to list calendars: {e}")))?;
-
-    if !list_resp.status().is_success() {
-        let err = list_resp.text().await.unwrap_or_default();
-        return Err(GwsError::Api {
-            code: 0,
-            message: err,
-            reason: "calendarList_failed".to_string(),
-            enable_url: None,
-        });
-    }
-
-    let list_json: Value = list_resp
-        .json()
-        .await
-        .map_err(|e| GwsError::Other(anyhow::anyhow!("Failed to parse calendar list: {e}")))?;
+    let list_json = get_calendar_json(
+        &client,
+        &format!("{CALENDAR_API}/users/me/calendarList"),
+        &token,
+        &[],
+        "calendarList_failed",
+    )
+    .await?;
 
     let calendars = list_json
         .get("items")
@@ -311,7 +297,7 @@ async fn handle_agenda(matches: &ArgMatches) -> Result<(), GwsError> {
         })
         .collect();
 
-    let mut all_events: Vec<Value> = stream::iter(filtered_calendars)
+    let results: Vec<(String, Result<Vec<Value>, GwsError>)> = stream::iter(filtered_calendars)
         .map(|cal| {
             let client = &client;
             let token = &token;
@@ -319,68 +305,35 @@ async fn handle_agenda(matches: &ArgMatches) -> Result<(), GwsError> {
             let time_max = &time_max;
             async move {
                 let events_url = format!(
-                    "https://www.googleapis.com/calendar/v3/calendars/{}/events",
+                    "{CALENDAR_API}/calendars/{}/events",
                     crate::validate::encode_path_segment(&cal.id),
                 );
-
                 let query = events_list_query(time_min, time_max, tz);
-                let resp = crate::client::send_with_retry(|| {
-                    client.get(&events_url).query(&query).bearer_auth(token)
-                })
-                .await;
-
-                let resp = match resp {
-                    Ok(r) if r.status().is_success() => r,
-                    _ => return vec![],
-                };
-
-                let events_json: Value = match resp.json().await {
-                    Ok(v) => v,
-                    Err(_) => return vec![],
-                };
-
-                let mut events = Vec::new();
-                if let Some(items) = events_json.get("items").and_then(|i| i.as_array()) {
-                    for event in items {
-                        let start = event
-                            .get("start")
-                            .and_then(|s| s.get("dateTime").or_else(|| s.get("date")))
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        let end = event
-                            .get("end")
-                            .and_then(|s| s.get("dateTime").or_else(|| s.get("date")))
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        let summary = event
-                            .get("summary")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("(No title)")
-                            .to_string();
-                        let location = event
-                            .get("location")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string();
-
-                        events.push(json!({
-                            "start": start,
-                            "end": end,
-                            "summary": summary,
-                            "calendar": cal.summary,
-                            "location": location,
-                        }));
-                    }
-                }
-                events
+                let events =
+                    get_calendar_json(client, &events_url, token, &query, "events_list_failed")
+                        .await
+                        .map(|json| {
+                            json.get("items")
+                                .and_then(|i| i.as_array())
+                                .map(|items| {
+                                    items
+                                        .iter()
+                                        .map(|event| agenda_entry(event, &cal.summary))
+                                        .collect()
+                                })
+                                .unwrap_or_default()
+                        });
+                (cal.summary, events)
             }
         })
         .buffer_unordered(5)
-        .flat_map(stream::iter)
         .collect()
         .await;
+
+    let (mut all_events, failures) = merge_calendar_results(results);
+    for failure in &failures {
+        eprintln!("Warning: {}", crate::output::sanitize_for_terminal(failure));
+    }
 
     // 3. Sort by start time
     sort_events(&mut all_events, tz);
@@ -396,7 +349,95 @@ async fn handle_agenda(matches: &ArgMatches) -> Result<(), GwsError> {
         "{}",
         crate::formatter::format_value(&output, &output_format)
     );
+
+    // The agenda above is incomplete: exit non-zero without a second JSON
+    // document on stdout (the warnings already named each calendar).
+    if !failures.is_empty() {
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+        std::process::exit(GwsError::EXIT_CODE_API);
+    }
     Ok(())
+}
+
+const CALENDAR_API: &str = "https://www.googleapis.com/calendar/v3";
+
+/// GET a Calendar API URL and parse its JSON body.
+async fn get_calendar_json(
+    client: &reqwest::Client,
+    url: &str,
+    token: &str,
+    query: &[(&str, &str)],
+    reason: &str,
+) -> Result<Value, GwsError> {
+    let resp = crate::client::send_with_retry(|| client.get(url).query(query).bearer_auth(token))
+        .await
+        .map_err(|e| GwsError::Other(anyhow::anyhow!("Request failed: {e}")))?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(GwsError::Api {
+            code: status.as_u16(),
+            message: body,
+            reason: reason.to_string(),
+            enable_url: None,
+        });
+    }
+
+    resp.json()
+        .await
+        .map_err(|e| GwsError::Other(anyhow::anyhow!("Failed to parse response: {e}")))
+}
+
+fn agenda_entry(event: &Value, calendar: &str) -> Value {
+    let time = |key: &str| {
+        event
+            .get(key)
+            .and_then(|s| s.get("dateTime").or_else(|| s.get("date")))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+    json!({
+        "start": time("start"),
+        "end": time("end"),
+        "summary": event.get("summary").and_then(|v| v.as_str()).unwrap_or("(No title)"),
+        "calendar": calendar,
+        "location": event.get("location").and_then(|v| v.as_str()).unwrap_or(""),
+    })
+}
+
+/// Combine per-calendar results into one event list, plus a message for
+/// each calendar whose events could not be fetched.
+fn merge_calendar_results(
+    results: Vec<(String, Result<Vec<Value>, GwsError>)>,
+) -> (Vec<Value>, Vec<String>) {
+    let mut events = Vec::new();
+    let mut failures = Vec::new();
+    for (calendar, result) in results {
+        match result {
+            Ok(items) => events.extend(items),
+            Err(e) => failures.push(format!(
+                "could not fetch events for calendar '{calendar}': {}",
+                describe_error(&e)
+            )),
+        }
+    }
+    (events, failures)
+}
+
+fn describe_error(err: &GwsError) -> String {
+    match err {
+        GwsError::Api { code, message, .. } => {
+            let detail = serde_json::from_str::<Value>(message)
+                .ok()
+                .and_then(|v| v.pointer("/error/message")?.as_str().map(str::to_string))
+                .unwrap_or_else(|| message.clone());
+            format!("HTTP {code}: {detail}")
+        }
+        other => other.to_string(),
+    }
 }
 
 /// Parse an event start (RFC3339 `dateTime`, or all-day `date` taken as the
@@ -820,6 +861,71 @@ mod tests {
                 "2026-10-20T08:00:00-06:00",
             ]
         );
+    }
+
+    /// Serve one canned HTTP response per connection on a local port.
+    async fn serve_responses(responses: Vec<(&'static str, &'static str)>) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            for (status, body) in responses {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut buf = [0_u8; 8192];
+                let _ = stream.read(&mut buf).await.unwrap();
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn calendar_request_errors_keep_http_status() {
+        let base = serve_responses(vec![
+            ("403 Forbidden", r#"{"error":{"message":"denied"}}"#),
+            ("200 OK", "not json"),
+        ])
+        .await;
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+
+        let err = get_calendar_json(&client, &base, "t", &[], "calendarList_failed")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, GwsError::Api { code: 403, .. }),
+            "got {err:?}"
+        );
+
+        let err = get_calendar_json(&client, &base, "t", &[], "events_list_failed").await;
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn agenda_reports_calendars_that_failed() {
+        let results = vec![
+            (
+                "Work".to_string(),
+                Ok(vec![json!({ "summary": "Standup" })]),
+            ),
+            (
+                "Team Offsite".to_string(),
+                Err(GwsError::Api {
+                    code: 404,
+                    message: "Not Found".to_string(),
+                    reason: "events_list_failed".to_string(),
+                    enable_url: None,
+                }),
+            ),
+        ];
+        let (events, failures) = merge_calendar_results(results);
+        assert_eq!(events.len(), 1);
+        assert_eq!(failures.len(), 1);
+        assert!(failures[0].contains("Team Offsite"), "{}", failures[0]);
+        assert!(failures[0].contains("404"), "{}", failures[0]);
     }
 
     fn agenda_range_at(range: AgendaRange, now: &str) -> (String, String) {

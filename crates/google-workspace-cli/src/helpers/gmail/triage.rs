@@ -86,82 +86,85 @@ pub async fn handle_triage(matches: &ArgMatches) -> Result<(), GwsError> {
         return Ok(());
     }
 
-    // 2. Fetch metadata for each message concurrently
-    use futures_util::stream::{self, StreamExt};
-
-    // Collect message IDs upfront (owned) to avoid lifetime issues in async closures
+    // 2. Fetch metadata for each message concurrently, keeping list order
     let msg_ids: Vec<String> = messages
         .iter()
         .filter_map(|m| m.get("id").and_then(|v| v.as_str()).map(|s| s.to_string()))
         .collect();
 
-    let results: Vec<Value> = stream::iter(msg_ids)
-        .map(|msg_id| {
-            let client = &client;
-            let token = &token;
-            async move {
-                let get_url = format!(
-                    "https://gmail.googleapis.com/gmail/v1/users/me/messages/{}?format=metadata&metadataHeaders=From&metadataHeaders=Subject&metadataHeaders=Date",
-                    msg_id
-                );
+    let (results, failed) = fetch_in_order(msg_ids, |msg_id| {
+        let client = &client;
+        let token = &token;
+        async move {
+            let get_url = format!(
+                "https://gmail.googleapis.com/gmail/v1/users/me/messages/{}?format=metadata&metadataHeaders=From&metadataHeaders=Subject&metadataHeaders=Date",
+                msg_id
+            );
 
-                let get_resp = crate::client::send_with_retry(|| {
-                    client.get(&get_url).bearer_auth(token)
-                })
-                .await
-                .ok()?;
+            let get_resp =
+                crate::client::send_with_retry(|| client.get(&get_url).bearer_auth(token))
+                    .await
+                    .map_err(|e| e.to_string())?;
 
-                if !get_resp.status().is_success() {
-                    return None;
-                }
+            if !get_resp.status().is_success() {
+                return Err(format!("HTTP {}", get_resp.status().as_u16()));
+            }
 
-                let msg_json: Value = get_resp.json().await.ok()?;
+            let msg_json: Value = get_resp.json().await.map_err(|e| e.to_string())?;
 
-                let headers = msg_json
-                    .get("payload")
-                    .and_then(|p| p.get("headers"))
-                    .and_then(|h| h.as_array());
+            let headers = msg_json
+                .get("payload")
+                .and_then(|p| p.get("headers"))
+                .and_then(|h| h.as_array());
 
-                let mut from = String::new();
-                let mut subject = String::new();
-                let mut date = String::new();
+            let mut from = String::new();
+            let mut subject = String::new();
+            let mut date = String::new();
 
-                if let Some(headers) = headers {
-                    for h in headers {
-                        let name = h.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                        let value = h.get("value").and_then(|v| v.as_str()).unwrap_or("");
-                        // Header names are case-insensitive (RFC 5322 §1.2.2).
-                        match name.to_ascii_lowercase().as_str() {
-                            "from" => from = value.to_string(),
-                            "subject" => subject = value.to_string(),
-                            "date" => date = value.to_string(),
-                            _ => {}
-                        }
+            if let Some(headers) = headers {
+                for h in headers {
+                    let name = h.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                    let value = h.get("value").and_then(|v| v.as_str()).unwrap_or("");
+                    // Header names are case-insensitive (RFC 5322 §1.2.2).
+                    match name.to_ascii_lowercase().as_str() {
+                        "from" => from = value.to_string(),
+                        "subject" => subject = value.to_string(),
+                        "date" => date = value.to_string(),
+                        _ => {}
                     }
                 }
-
-                let mut entry = json!({
-                    "id": msg_id,
-                    "from": from,
-                    "subject": subject,
-                    "date": date,
-                });
-
-                if show_labels {
-                    let labels = msg_json
-                        .get("labelIds")
-                        .cloned()
-                        .unwrap_or(Value::Array(vec![]));
-                    entry["labels"] = labels;
-                }
-
-                Some(entry)
             }
-        })
-        .buffer_unordered(10)
-        .filter_map(|r| async { r })
-        .collect()
-        .await;
+
+            let mut entry = json!({
+                "id": msg_id,
+                "from": from,
+                "subject": subject,
+                "date": date,
+            });
+
+            if show_labels {
+                let labels = msg_json
+                    .get("labelIds")
+                    .cloned()
+                    .unwrap_or(Value::Array(vec![]));
+                entry["labels"] = labels;
+            }
+
+            Ok(entry)
+        }
+    })
+    .await;
+
+    if !failed.is_empty() {
+        eprintln!("Warning: could not fetch {} message(s):", failed.len());
+        for (id, err) in &failed {
+            eprintln!(
+                "  {}: {}",
+                crate::output::sanitize_for_terminal(id),
+                crate::output::sanitize_for_terminal(err)
+            );
+        }
+    }
 
     // 3. Output
     let result_count = results.len();
@@ -179,6 +182,35 @@ pub async fn handle_triage(matches: &ArgMatches) -> Result<(), GwsError> {
     Ok(())
 }
 
+/// Run `fetch` for every ID with up to 10 requests in flight. Successes keep
+/// the order of `ids`; failures are returned as `(id, error)` pairs.
+async fn fetch_in_order<F, Fut>(ids: Vec<String>, fetch: F) -> (Vec<Value>, Vec<(String, String)>)
+where
+    F: Fn(String) -> Fut,
+    Fut: std::future::Future<Output = Result<Value, String>>,
+{
+    use futures_util::stream::{self, StreamExt};
+
+    let outcomes: Vec<(String, Result<Value, String>)> = stream::iter(ids)
+        .map(|id| {
+            let fut = fetch(id.clone());
+            async move { (id, fut.await) }
+        })
+        .buffered(10)
+        .collect()
+        .await;
+
+    let mut messages = Vec::new();
+    let mut failed = Vec::new();
+    for (id, outcome) in outcomes {
+        match outcome {
+            Ok(message) => messages.push(message),
+            Err(e) => failed.push((id, e)),
+        }
+    }
+    (messages, failed)
+}
+
 /// Returns the human-readable "no messages" diagnostic string.
 /// Extracted so the test can reference the exact same message without duplication.
 fn no_messages_msg(query: &str) -> String {
@@ -190,7 +222,31 @@ fn no_messages_msg(query: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::no_messages_msg;
+    use super::{fetch_in_order, no_messages_msg};
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn fetch_in_order_keeps_list_order_and_reports_failures() {
+        let ids: Vec<String> = (0..12).map(|i| format!("m{i}")).collect();
+        let (messages, failed) = fetch_in_order(ids, |id| async move {
+            let n: u64 = id[1..].parse().unwrap();
+            // Later IDs finish first, so completion order is reversed.
+            tokio::time::sleep(std::time::Duration::from_millis(30 - 2 * n)).await;
+            if id == "m4" {
+                Err("HTTP 404".to_string())
+            } else {
+                Ok(json!({ "id": id }))
+            }
+        })
+        .await;
+        let order: Vec<_> = messages.iter().map(|m| m["id"].as_str().unwrap()).collect();
+        let expected: Vec<String> = (0..12)
+            .filter(|i| *i != 4)
+            .map(|i| format!("m{i}"))
+            .collect();
+        assert_eq!(order, expected);
+        assert_eq!(failed, vec![("m4".to_string(), "HTTP 404".to_string())]);
+    }
     use clap::{Arg, ArgAction, Command};
 
     /// Build a clap command matching the +triage definition so we can

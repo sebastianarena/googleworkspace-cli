@@ -35,7 +35,10 @@ pub(super) async fn handle_read(
         fetch_message_metadata(&client, &t, message_id).await?
     };
 
-    let format = matches.get_one::<String>("format").unwrap();
+    // No clap default: the global --format check would see it and warn.
+    let format = matches
+        .get_one::<String>("format")
+        .map_or("text", String::as_str);
     let show_headers = matches.get_flag("headers");
     let use_html = matches.get_flag("html");
 

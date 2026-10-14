@@ -2095,9 +2095,8 @@ Use fragment tags (<p>, <b>, <a>, etc.) — no <html>/<body> wrapper needed.
                 .arg(
                     Arg::new("format")
                         .long("format")
-                        .help("Output format (text, json)")
-                        .value_parser(["text", "json"])
-                        .default_value("text"),
+                        .help("Output format: text (default), json")
+                        .value_parser(["text", "json"]),
                 )
                 .arg(
                     Arg::new("html")
@@ -2655,6 +2654,30 @@ mod tests {
         assert!(subcommands.contains(&"+reply-all"));
         assert!(subcommands.contains(&"+forward"));
         assert!(subcommands.contains(&"+read"));
+    }
+
+    #[test]
+    fn test_read_format_has_no_default() {
+        // The global --format check sees +read's flag; a "text" default made
+        // it warn "unknown output format 'text'" on every +read.
+        let doc = crate::discovery::RestDescription {
+            name: "gmail".to_string(),
+            ..Default::default()
+        };
+        let cli = crate::commands::build_cli(&doc);
+        let matches = cli
+            .clone()
+            .try_get_matches_from(["gws", "+read", "--id", "m1"])
+            .unwrap();
+        assert!(matches.get_one::<String>("format").is_none());
+        let read = matches.subcommand_matches("+read").unwrap();
+        assert!(read.get_one::<String>("format").is_none());
+
+        let matches = cli
+            .try_get_matches_from(["gws", "+read", "--id", "m1", "--format", "json"])
+            .unwrap();
+        let read = matches.subcommand_matches("+read").unwrap();
+        assert_eq!(read.get_one::<String>("format").unwrap(), "json");
     }
 
     #[test]

@@ -16,8 +16,8 @@ use super::Helper;
 use crate::auth;
 use crate::error::GwsError;
 use crate::executor;
-use clap::{Arg, ArgMatches, Command};
-use serde_json::json;
+use clap::{Arg, ArgAction, ArgMatches, Command};
+use serde_json::{json, Value};
 use std::future::Future;
 use std::pin::Pin;
 
@@ -43,13 +43,20 @@ impl Helper for SheetsHelper {
                     Arg::new("values")
                         .long("values")
                         .help("Comma-separated values (simple strings)")
-                        .value_name("VALUES"),
+                        .value_name("VALUES")
+                        .conflicts_with("json-values"),
                 )
                 .arg(
                     Arg::new("json-values")
                         .long("json-values")
-                        .help("JSON array of rows, e.g. '[[\"a\",\"b\"],[\"c\",\"d\"]]'")
+                        .help("JSON array of rows, e.g. '[[\"a\",100,true],[\"c\",200,false]]'")
                         .value_name("JSON"),
+                )
+                .arg(
+                    Arg::new("raw")
+                        .long("raw")
+                        .help("Store values as given (valueInputOption RAW) instead of parsing them as if typed (USER_ENTERED), which turns '00123' into 123 and '=A1' into a formula")
+                        .action(ArgAction::SetTrue),
                 )
                 .arg(
                     Arg::new("range")
@@ -61,7 +68,9 @@ impl Helper for SheetsHelper {
                     r#"EXAMPLES:
   gws sheets +append --spreadsheet ID --values 'Alice,100,true'
   gws sheets +append --spreadsheet ID --json-values '[["a","b"],["c","d"]]'
+  gws sheets +append --spreadsheet ID --json-values '[["Alice",100,true]]'
   gws sheets +append --spreadsheet ID --range "Sheet2!A1" --values 'Alice,100'
+  gws sheets +append --spreadsheet ID --values '00123,=not a formula' --raw
 
 TIPS:
   Use --values for simple single-row appends.
@@ -110,7 +119,7 @@ TIPS:
     ) -> Pin<Box<dyn Future<Output = Result<bool, GwsError>> + Send + 'a>> {
         Box::pin(async move {
             if let Some(matches) = matches.subcommand_matches("+append") {
-                let config = parse_append_args(matches);
+                let config = parse_append_args(matches)?;
                 let (params_str, body_str, scopes) = build_append_request(&config, doc)?;
 
                 let scope_strs: Vec<&str> = scopes.iter().map(|s| s.as_str()).collect();
@@ -223,7 +232,7 @@ fn build_append_request(
     let params = json!({
         "spreadsheetId": config.spreadsheet_id,
         "range": config.range,
-        "valueInputOption": "USER_ENTERED"
+        "valueInputOption": config.value_input_option
     });
 
     let body = json!({
@@ -270,31 +279,34 @@ pub struct AppendConfig {
     pub spreadsheet_id: String,
     /// Target range in A1 notation (e.g. "Sheet2!A1"). Defaults to "A1".
     pub range: String,
-    /// The rows to append, where each inner Vec represents one row.
-    pub values: Vec<Vec<String>>,
+    /// The rows to append, where each inner Vec represents one row of
+    /// JSON scalars (string, number, boolean or null).
+    pub values: Vec<Vec<Value>>,
+    /// `USER_ENTERED` (default) or `RAW` (`--raw`).
+    pub value_input_option: &'static str,
 }
 
 /// Parses arguments for the `+append` command.
 ///
 /// Supports both `--values` (single row) and `--json-values` (single or multi-row).
-pub fn parse_append_args(matches: &ArgMatches) -> AppendConfig {
+/// Invalid JSON or an empty row set is an error.
+pub fn parse_append_args(matches: &ArgMatches) -> Result<AppendConfig, GwsError> {
     let values = if let Some(json_str) = matches.get_one::<String>("json-values") {
-        // Try parsing as array-of-arrays (multi-row) first
-        if let Ok(parsed) = serde_json::from_str::<Vec<Vec<String>>>(json_str) {
-            parsed
-        } else if let Ok(parsed) = serde_json::from_str::<Vec<String>>(json_str) {
-            // Single flat array — treat as one row
-            vec![parsed]
-        } else {
-            eprintln!(
-                "Warning: --json-values is not valid JSON; expected an array or array-of-arrays"
-            );
-            Vec::new()
-        }
+        parse_json_rows(json_str)?
     } else if let Some(values_str) = matches.get_one::<String>("values") {
-        vec![values_str.split(',').map(|s| s.to_string()).collect()]
+        if values_str.is_empty() {
+            return Err(GwsError::Validation(
+                "--values must not be empty".to_string(),
+            ));
+        }
+        vec![values_str
+            .split(',')
+            .map(|s| Value::String(s.to_string()))
+            .collect()]
     } else {
-        Vec::new()
+        return Err(GwsError::Validation(
+            "One of --values or --json-values is required".to_string(),
+        ));
     };
 
     let range = matches
@@ -302,11 +314,57 @@ pub fn parse_append_args(matches: &ArgMatches) -> AppendConfig {
         .cloned()
         .unwrap_or_else(|| "A1".to_string());
 
-    AppendConfig {
+    let value_input_option = if matches.get_flag("raw") {
+        "RAW"
+    } else {
+        "USER_ENTERED"
+    };
+
+    Ok(AppendConfig {
         spreadsheet_id: matches.get_one::<String>("spreadsheet").unwrap().clone(),
         range,
         values,
+        value_input_option,
+    })
+}
+
+/// Parses `--json-values`: an array of rows, or a flat array as a single row.
+/// Cells may be strings, numbers, booleans or null.
+fn parse_json_rows(json_str: &str) -> Result<Vec<Vec<Value>>, GwsError> {
+    let invalid = |detail: &str| {
+        GwsError::Validation(format!(
+            "--json-values {detail}; expected an array of rows, e.g. '[[\"a\",1,true]]'"
+        ))
+    };
+    let parsed: Value =
+        serde_json::from_str(json_str).map_err(|e| invalid(&format!("is not valid JSON ({e})")))?;
+    let Value::Array(items) = parsed else {
+        return Err(invalid("is not an array"));
+    };
+
+    let rows: Vec<Vec<Value>> = if items.iter().all(Value::is_array) {
+        items
+            .into_iter()
+            .filter_map(|row| match row {
+                Value::Array(cells) => Some(cells),
+                _ => None,
+            })
+            .collect()
+    } else if items.iter().any(Value::is_array) {
+        return Err(invalid("mixes rows and single values"));
+    } else {
+        vec![items]
+    };
+
+    if rows.iter().all(Vec::is_empty) {
+        return Err(invalid("contains no values"));
     }
+    if rows.iter().flatten().any(|c| c.is_array() || c.is_object()) {
+        return Err(invalid(
+            "has a cell that is not a string, number, boolean or null",
+        ));
+    }
+    Ok(rows)
 }
 
 /// Configuration for reading values from a spreadsheet.
@@ -368,7 +426,8 @@ mod tests {
             .arg(Arg::new("spreadsheet").long("spreadsheet"))
             .arg(Arg::new("values").long("values"))
             .arg(Arg::new("json-values").long("json-values"))
-            .arg(Arg::new("range").long("range"));
+            .arg(Arg::new("range").long("range"))
+            .arg(Arg::new("raw").long("raw").action(ArgAction::SetTrue));
         cmd.try_get_matches_from(args).unwrap()
     }
 
@@ -385,7 +444,8 @@ mod tests {
         let config = AppendConfig {
             spreadsheet_id: "123".to_string(),
             range: "A1".to_string(),
-            values: vec![vec!["a".to_string(), "b".to_string(), "c".to_string()]],
+            values: vec![vec![json!("a"), json!("b"), json!("c")]],
+            value_input_option: "USER_ENTERED",
         };
         let (params, body, scopes) = build_append_request(&config, &doc).unwrap();
 
@@ -403,7 +463,8 @@ mod tests {
         let config = AppendConfig {
             spreadsheet_id: "123".to_string(),
             range: "Sheet2!A1".to_string(),
-            values: vec![vec!["x".to_string()]],
+            values: vec![vec![json!("x")]],
+            value_input_option: "USER_ENTERED",
         };
         let (params, _body, _scopes) = build_append_request(&config, &doc).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&params).unwrap();
@@ -427,10 +488,14 @@ mod tests {
     #[test]
     fn test_parse_append_args_values() {
         let matches = make_matches_append(&["test", "--spreadsheet", "123", "--values", "a,b,c"]);
-        let config = parse_append_args(&matches);
+        let config = parse_append_args(&matches).unwrap();
         assert_eq!(config.spreadsheet_id, "123");
         assert_eq!(config.range, "A1");
-        assert_eq!(config.values, vec![vec!["a", "b", "c"]]);
+        assert_eq!(
+            config.values,
+            vec![vec![json!("a"), json!("b"), json!("c")]]
+        );
+        assert_eq!(config.value_input_option, "USER_ENTERED");
     }
 
     #[test]
@@ -444,14 +509,14 @@ mod tests {
             "--values",
             "a,b",
         ]);
-        let config = parse_append_args(&matches);
+        let config = parse_append_args(&matches).unwrap();
         assert_eq!(config.range, "Sheet2!A1");
     }
 
     #[test]
     fn test_parse_append_args_default_range() {
         let matches = make_matches_append(&["test", "--spreadsheet", "123", "--values", "a"]);
-        let config = parse_append_args(&matches);
+        let config = parse_append_args(&matches).unwrap();
         assert_eq!(config.range, "A1");
     }
 
@@ -464,8 +529,11 @@ mod tests {
             "--json-values",
             r#"["a","b","c"]"#,
         ]);
-        let config = parse_append_args(&matches);
-        assert_eq!(config.values, vec![vec!["a", "b", "c"]]);
+        let config = parse_append_args(&matches).unwrap();
+        assert_eq!(
+            config.values,
+            vec![vec![json!("a"), json!("b"), json!("c")]]
+        );
     }
 
     #[test]
@@ -477,11 +545,73 @@ mod tests {
             "--json-values",
             r#"[["Alice","100"],["Bob","200"]]"#,
         ]);
-        let config = parse_append_args(&matches);
+        let config = parse_append_args(&matches).unwrap();
         assert_eq!(
             config.values,
-            vec![vec!["Alice", "100"], vec!["Bob", "200"]]
+            vec![
+                vec![json!("Alice"), json!("100")],
+                vec![json!("Bob"), json!("200")]
+            ]
         );
+    }
+
+    #[test]
+    fn test_parse_append_args_json_mixed_types() {
+        let matches = make_matches_append(&[
+            "test",
+            "--spreadsheet",
+            "123",
+            "--json-values",
+            r#"[["Alice",100,true,null]]"#,
+        ]);
+        let config = parse_append_args(&matches).unwrap();
+        assert_eq!(
+            config.values,
+            vec![vec![json!("Alice"), json!(100), json!(true), json!(null)]]
+        );
+
+        let matches = make_matches_append(&[
+            "test",
+            "--spreadsheet",
+            "123",
+            "--json-values",
+            r#"["Bob",2.5]"#,
+        ]);
+        let config = parse_append_args(&matches).unwrap();
+        assert_eq!(config.values, vec![vec![json!("Bob"), json!(2.5)]]);
+    }
+
+    #[test]
+    fn test_parse_append_args_rejects_bad_or_empty_input() {
+        for bad in [
+            "not json",
+            "[]",
+            "[[]]",
+            r#"{"a":1}"#,
+            r#"[["a"],"b"]"#,
+            r#"[[{"a":1}]]"#,
+        ] {
+            let matches =
+                make_matches_append(&["test", "--spreadsheet", "123", "--json-values", bad]);
+            assert!(parse_append_args(&matches).is_err(), "accepted {bad}");
+        }
+
+        let matches = make_matches_append(&["test", "--spreadsheet", "123", "--values", ""]);
+        assert!(parse_append_args(&matches).is_err());
+
+        let matches = make_matches_append(&["test", "--spreadsheet", "123"]);
+        assert!(parse_append_args(&matches).is_err());
+    }
+
+    #[test]
+    fn test_parse_append_args_raw() {
+        let matches =
+            make_matches_append(&["test", "--spreadsheet", "123", "--values", "00123", "--raw"]);
+        let config = parse_append_args(&matches).unwrap();
+        assert_eq!(config.value_input_option, "RAW");
+        let (params, _, _) = build_append_request(&config, &make_mock_doc()).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&params).unwrap();
+        assert_eq!(parsed["valueInputOption"], "RAW");
     }
 
     #[test]
@@ -491,9 +621,10 @@ mod tests {
             spreadsheet_id: "123".to_string(),
             range: "A1".to_string(),
             values: vec![
-                vec!["Alice".to_string(), "100".to_string()],
-                vec!["Bob".to_string(), "200".to_string()],
+                vec![json!("Alice"), json!("100")],
+                vec![json!("Bob"), json!("200")],
             ],
+            value_input_option: "USER_ENTERED",
         };
         let (_params, body, _scopes) = build_append_request(&config, &doc).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();

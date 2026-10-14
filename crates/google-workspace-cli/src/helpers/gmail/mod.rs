@@ -822,27 +822,42 @@ struct PayloadContents {
     parts: Vec<OriginalPart>,
 }
 
-/// Decode a base64url-encoded text body part, returning the string on success.
-fn decode_text_body(data: &str, mime_label: &str) -> Option<String> {
-    match URL_SAFE.decode(data) {
-        Ok(decoded) => match String::from_utf8(decoded) {
-            Ok(s) => Some(s),
-            Err(e) => {
-                eprintln!(
-                    "Warning: {mime_label} body is not valid UTF-8: {}",
-                    sanitize_for_terminal(&e.to_string())
-                );
-                None
-            }
-        },
+/// Decode a base64url-encoded text body part into a string, honouring the
+/// `charset` of its Content-Type. Undeclared or unknown charsets are read as
+/// UTF-8, lossily if need be, so a mislabelled body is never discarded.
+fn decode_text_body(data: &str, mime_label: &str, content_type: Option<&str>) -> Option<String> {
+    let decoded = match URL_SAFE.decode(data) {
+        Ok(decoded) => decoded,
         Err(e) => {
             eprintln!(
                 "Warning: {mime_label} body has invalid base64: {}",
                 sanitize_for_terminal(&e.to_string())
             );
-            None
+            return None;
         }
+    };
+    let encoding = content_type
+        .and_then(content_type_charset)
+        .and_then(|label| encoding_rs::Encoding::for_label(label.as_bytes()))
+        .unwrap_or(encoding_rs::UTF_8);
+    let (text, _, had_errors) = encoding.decode(&decoded);
+    if had_errors {
+        eprintln!(
+            "Warning: {mime_label} body is not valid {}; invalid bytes were replaced",
+            encoding.name()
+        );
     }
+    Some(text.into_owned())
+}
+
+/// Extract the `charset` parameter from a Content-Type header value.
+fn content_type_charset(content_type: &str) -> Option<&str> {
+    content_type.split(';').skip(1).find_map(|param| {
+        let (name, value) = param.split_once('=')?;
+        name.trim()
+            .eq_ignore_ascii_case("charset")
+            .then(|| value.trim().trim_matches('"').trim())
+    })
 }
 
 /// Synthesize a filename from the part index and MIME type when no filename is present.
@@ -939,10 +954,11 @@ fn extract_payload_recursive(
     if is_body_text_part {
         // body_data is guaranteed Some by the is_body_text_part check above.
         let data = body_data.unwrap();
+        let content_type = get_part_header(part, "Content-Type");
         if mime_type == "text/plain" && contents.body_text.is_none() {
-            contents.body_text = decode_text_body(data, "text/plain");
+            contents.body_text = decode_text_body(data, "text/plain", content_type);
         } else if mime_type == "text/html" && contents.body_html.is_none() {
-            contents.body_html = decode_text_body(data, "text/html");
+            contents.body_html = decode_text_body(data, "text/html", content_type);
         }
     } else if is_hydratable {
         // This part has fetchable data — classify as inline or attachment
@@ -3561,6 +3577,50 @@ mod tests {
 
     fn base64url(s: &str) -> String {
         URL_SAFE.encode(s)
+    }
+
+    #[test]
+    fn test_extract_payload_contents_decodes_declared_charset() {
+        let latin1: &[u8] = b"Caf\xe9 meeting";
+        let cp1252: &[u8] = b"<p>\x93Hello\x94 \x80 5</p>";
+        let payload = json!({
+            "mimeType": "multipart/alternative",
+            "parts": [
+                {
+                    "mimeType": "text/plain",
+                    "headers": [
+                        { "name": "Content-Type", "value": "text/plain; charset=\"ISO-8859-1\"; format=flowed" }
+                    ],
+                    "body": { "data": URL_SAFE.encode(latin1) }
+                },
+                {
+                    "mimeType": "text/html",
+                    "headers": [
+                        { "name": "content-type", "value": "text/html;charset=windows-1252" }
+                    ],
+                    "body": { "data": URL_SAFE.encode(cp1252) }
+                }
+            ]
+        });
+        let contents = extract_payload_contents(&payload);
+        assert_eq!(contents.body_text.as_deref(), Some("Caf\u{e9} meeting"));
+        assert_eq!(
+            contents.body_html.as_deref(),
+            Some("<p>\u{201c}Hello\u{201d} \u{20ac} 5</p>")
+        );
+    }
+
+    #[test]
+    fn test_extract_payload_contents_invalid_utf8_without_charset_is_lossy() {
+        let bytes: &[u8] = b"Caf\xe9 meeting";
+        let payload = json!({
+            "mimeType": "text/plain",
+            "body": { "data": URL_SAFE.encode(bytes) }
+        });
+        assert_eq!(
+            extract_plain_text_body(&payload).as_deref(),
+            Some("Caf\u{fffd} meeting")
+        );
     }
 
     #[test]

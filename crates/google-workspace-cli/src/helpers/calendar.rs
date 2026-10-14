@@ -323,17 +323,9 @@ async fn handle_agenda(matches: &ArgMatches) -> Result<(), GwsError> {
                     crate::validate::encode_path_segment(&cal.id),
                 );
 
+                let query = events_list_query(time_min, time_max, tz);
                 let resp = crate::client::send_with_retry(|| {
-                    client
-                        .get(&events_url)
-                        .query(&[
-                            ("timeMin", time_min.as_str()),
-                            ("timeMax", time_max.as_str()),
-                            ("singleEvents", "true"),
-                            ("orderBy", "startTime"),
-                            ("maxResults", "50"),
-                        ])
-                        .bearer_auth(token)
+                    client.get(&events_url).query(&query).bearer_auth(token)
                 })
                 .await;
 
@@ -409,6 +401,22 @@ async fn handle_agenda(matches: &ArgMatches) -> Result<(), GwsError> {
         crate::formatter::format_value(&output, &output_format)
     );
     Ok(())
+}
+
+fn events_list_query<'a>(
+    time_min: &'a str,
+    time_max: &'a str,
+    tz: Tz,
+) -> Vec<(&'static str, &'a str)> {
+    vec![
+        ("timeMin", time_min),
+        ("timeMax", time_max),
+        ("singleEvents", "true"),
+        ("orderBy", "startTime"),
+        ("maxResults", "50"),
+        // Return event times in the account zone rather than each calendar's.
+        ("timeZone", tz.name()),
+    ]
 }
 
 enum AgendaRange {
@@ -754,6 +762,17 @@ mod tests {
         assert!(body.contains("Discuss stuff"));
         assert!(body.contains("a@b.com"));
         assert!(body.contains("c@d.com"));
+    }
+
+    #[test]
+    fn agenda_requests_events_in_account_timezone() {
+        let query = events_list_query(
+            "2026-10-20T00:00:00-06:00",
+            "2026-10-21T00:00:00-06:00",
+            chrono_tz::America::Denver,
+        );
+        assert!(query.contains(&("timeZone", "America/Denver")));
+        assert!(query.contains(&("timeMin", "2026-10-20T00:00:00-06:00")));
     }
 
     fn agenda_range_at(range: AgendaRange, now: &str) -> (String, String) {

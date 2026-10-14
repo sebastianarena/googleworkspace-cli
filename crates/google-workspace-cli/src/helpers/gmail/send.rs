@@ -22,22 +22,17 @@ pub(super) async fn handle_send(
     let mut config = parse_send_args(matches)?;
     let dry_run = matches.get_flag("dry-run");
 
-    let token = if dry_run {
-        None
-    } else {
-        // Resolve the target method (send or draft) and use its discovery
-        // doc scopes, so the token matches the operation. resolve_sender
-        // gracefully degrades if the token doesn't cover the sendAs.list
-        // endpoint.
-        let method = super::resolve_mail_method(doc, matches.get_flag("draft"))?;
-        let scopes: Vec<&str> = method.scopes.iter().map(|s| s.as_str()).collect();
-        let t = auth::get_token(&scopes)
-            .await
-            .map_err(|e| GwsError::Auth(format!("Gmail auth failed: {e}")))?;
+    // Resolve the target method (send or draft) and use its discovery doc
+    // scopes, so the token matches the operation. resolve_sender gracefully
+    // degrades if the token doesn't cover the sendAs.list endpoint. A dry run
+    // resolves From too (read-only) so the preview shows the real header.
+    let method = super::resolve_mail_method(doc, matches.get_flag("draft"))?;
+    let scopes: Vec<&str> = method.scopes.iter().map(|s| s.as_str()).collect();
+    let token = get_token_or_dry_run(&scopes, dry_run).await?;
+    if let Some(t) = &token {
         let client = crate::client::build_client()?;
-        config.from = resolve_sender(&client, &t, config.from.as_deref()).await?;
-        Some(t)
-    };
+        config.from = resolve_sender(&client, t, config.from.as_deref()).await?;
+    }
 
     let raw = create_send_raw_message(&config)?;
 

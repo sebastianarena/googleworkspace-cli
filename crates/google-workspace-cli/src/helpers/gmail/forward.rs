@@ -23,20 +23,19 @@ pub(super) async fn handle_forward(
 
     let dry_run = matches.get_flag("dry-run");
 
-    let (original, token, client) = if dry_run {
+    // A dry run still fetches the original (read-only) when logged in, so the
+    // preview shows the real forwarded content.
+    let token = get_token_or_dry_run(&[GMAIL_SCOPE], dry_run).await?;
+    let (original, client) = if let Some(t) = &token {
+        let c = crate::client::build_client()?;
+        let orig = fetch_message_metadata(&c, t, &config.message_id).await?;
+        config.from = resolve_sender(&c, t, config.from.as_deref()).await?;
+        (orig, Some(c))
+    } else {
         (
             OriginalMessage::dry_run_placeholder(&config.message_id),
             None,
-            None,
         )
-    } else {
-        let t = auth::get_token(&[GMAIL_SCOPE])
-            .await
-            .map_err(|e| GwsError::Auth(format!("Gmail auth failed: {e}")))?;
-        let c = crate::client::build_client()?;
-        let orig = fetch_message_metadata(&c, &t, &config.message_id).await?;
-        config.from = resolve_sender(&c, &t, config.from.as_deref()).await?;
-        (orig, Some(t), Some(c))
     };
 
     // Select which original parts to include:
@@ -46,14 +45,17 @@ pub(super) async fn handle_forward(
     // - Plain-text mode: drop inline images entirely (matching Gmail web)
     // - HTML mode: include inline images (rendered via cid: in multipart/related)
     let mut all_attachments = config.attachments;
-    if let (Some(client), Some(token)) = (&client, &token) {
-        let selected: Vec<_> = original
-            .parts
-            .iter()
-            .filter(|p| include_original_part(p, config.html, config.no_original_attachments))
-            .cloned()
-            .collect();
-
+    let selected: Vec<_> = original
+        .parts
+        .iter()
+        .filter(|p| include_original_part(p, config.html, config.no_original_attachments))
+        .cloned()
+        .collect();
+    if dry_run {
+        if !selected.is_empty() {
+            eprintln!("Note: original attachments not included in dry-run preview");
+        }
+    } else if let (Some(client), Some(token)) = (&client, &token) {
         fetch_and_merge_original_parts(
             client,
             token,
@@ -62,8 +64,6 @@ pub(super) async fn handle_forward(
             &mut all_attachments,
         )
         .await?;
-    } else {
-        eprintln!("Note: original attachments not included in dry-run preview");
     }
 
     let subject = build_forward_subject(&original.subject);

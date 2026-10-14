@@ -227,7 +227,7 @@ pub(super) struct OriginalMessage {
 }
 
 impl OriginalMessage {
-    /// Placeholder used for `--dry-run` to avoid requiring auth/network.
+    /// Placeholder used for `--dry-run` when there are no credentials.
     pub(super) fn dry_run_placeholder(message_id: &str) -> Self {
         Self {
             thread_id: Some(format!("thread-{message_id}")),
@@ -970,10 +970,15 @@ fn decode_text_body(data: &str, mime_label: &str, content_type: Option<&str>) ->
 
 /// Extract the `charset` parameter from a Content-Type header value.
 fn content_type_charset(content_type: &str) -> Option<&str> {
-    content_type.split(';').skip(1).find_map(|param| {
+    header_param(content_type, "charset")
+}
+
+/// Extract a `name=value` parameter from a structured header value.
+fn header_param<'a>(header_value: &'a str, param_name: &str) -> Option<&'a str> {
+    header_value.split(';').skip(1).find_map(|param| {
         let (name, value) = param.split_once('=')?;
         name.trim()
-            .eq_ignore_ascii_case("charset")
+            .eq_ignore_ascii_case(param_name)
             .then(|| value.trim().trim_matches('"').trim())
     })
 }
@@ -1750,7 +1755,8 @@ pub(super) async fn dispatch_raw_email(
         page_delay_ms: 100,
     };
 
-    executor::execute_method(
+    let dry_run = matches.get_flag("dry-run");
+    let dry_run_info = executor::execute_method(
         doc,
         method,
         Some(&params_str),
@@ -1762,14 +1768,23 @@ pub(super) async fn dispatch_raw_email(
             data: raw_message.as_bytes(),
             content_type: "message/rfc822",
         }),
-        matches.get_flag("dry-run"),
+        dry_run,
         &pagination,
         None,
         &crate::helpers::modelarmor::SanitizeMode::Warn,
         &crate::formatter::OutputFormat::default(),
-        false,
+        // Capture the dry-run summary so the composed message can be added.
+        dry_run,
     )
     .await?;
+
+    if let Some(mut info) = dry_run_info.filter(|_| dry_run) {
+        info["message"] = Value::String(render_message_preview(raw_message));
+        println!(
+            "{}",
+            crate::formatter::format_value(&info, &crate::formatter::OutputFormat::default())
+        );
+    }
 
     if draft && !matches.get_flag("dry-run") {
         eprintln!("Tip: copy the draft \"id\" from the response above, then send with:");
@@ -1777,6 +1792,131 @@ pub(super) async fn dispatch_raw_email(
     }
 
     Ok(())
+}
+
+/// Render a composed RFC 822 message for `--dry-run`: headers as written,
+/// text parts decoded from their transfer encoding, other parts summarised.
+fn render_message_preview(raw: &str) -> String {
+    let mut out = String::new();
+    render_mime_entity(raw, &mut out);
+    out.replace("\r\n", "\n")
+}
+
+fn render_mime_entity(entity: &str, out: &mut String) {
+    let (headers, body) = entity.split_once("\r\n\r\n").unwrap_or((entity, ""));
+    out.push_str(headers);
+    out.push_str("\r\n\r\n");
+
+    let content_type = raw_header_value(headers, "Content-Type").unwrap_or_default();
+    let boundary = header_param(&content_type, "boundary")
+        .filter(|_| content_type.to_ascii_lowercase().starts_with("multipart/"));
+    if let Some(boundary) = boundary {
+        let delimiter = format!("--{boundary}");
+        for part in body.split(delimiter.as_str()).skip(1) {
+            if part.starts_with("--") {
+                break;
+            }
+            out.push_str(&delimiter);
+            out.push_str("\r\n");
+            let part = part.strip_prefix("\r\n").unwrap_or(part);
+            render_mime_entity(part.strip_suffix("\r\n").unwrap_or(part), out);
+        }
+        out.push_str(&delimiter);
+        out.push_str("--\r\n");
+        return;
+    }
+
+    let encoding = raw_header_value(headers, "Content-Transfer-Encoding")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let decoded = match encoding.as_str() {
+        "base64" => {
+            let compact: String = body.split_whitespace().collect();
+            base64::engine::general_purpose::STANDARD
+                .decode(compact)
+                .unwrap_or_else(|_| body.as_bytes().to_vec())
+        }
+        "quoted-printable" => decode_quoted_printable(body),
+        _ => body.as_bytes().to_vec(),
+    };
+    if content_type.is_empty() || content_type.to_ascii_lowercase().starts_with("text/") {
+        out.push_str(&String::from_utf8_lossy(&decoded));
+        out.push_str("\r\n");
+    } else {
+        out.push_str(&format!("[{} bytes omitted]\r\n", decoded.len()));
+    }
+}
+
+/// Look up an (unfolded) header value in a raw RFC 822 header block.
+fn raw_header_value(headers: &str, name: &str) -> Option<String> {
+    let mut value: Option<String> = None;
+    for line in headers.split("\r\n") {
+        if line.starts_with([' ', '\t']) {
+            if let Some(v) = value.as_mut() {
+                v.push(' ');
+                v.push_str(line.trim());
+            }
+            continue;
+        }
+        if value.is_some() {
+            break;
+        }
+        if let Some((n, v)) = line.split_once(':') {
+            if n.trim().eq_ignore_ascii_case(name) {
+                value = Some(v.trim().to_string());
+            }
+        }
+    }
+    value
+}
+
+/// Decode a quoted-printable body; malformed escapes are kept literally.
+fn decode_quoted_printable(s: &str) -> Vec<u8> {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'=' {
+            if bytes[i + 1..].starts_with(b"\r\n") {
+                i += 3;
+                continue;
+            }
+            if bytes[i + 1..].starts_with(b"\n") {
+                i += 2;
+                continue;
+            }
+            if let Some(byte) = s
+                .get(i + 1..i + 3)
+                .and_then(|hex| u8::from_str_radix(hex, 16).ok())
+            {
+                out.push(byte);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    out
+}
+
+/// Get a Gmail token. Under `--dry-run` a missing login is not an error:
+/// `None` tells the caller to preview with placeholder data instead.
+pub(super) async fn get_token_or_dry_run(
+    scopes: &[&str],
+    dry_run: bool,
+) -> Result<Option<String>, GwsError> {
+    match auth::get_token(scopes).await {
+        Ok(t) => Ok(Some(t)),
+        Err(e) if dry_run => {
+            eprintln!(
+                "Note: not logged in ({}); dry-run uses placeholder data",
+                sanitize_for_terminal(&e.to_string())
+            );
+            Ok(None)
+        }
+        Err(e) => Err(GwsError::Auth(format!("Gmail auth failed: {e}"))),
+    }
 }
 
 /// Add common arguments shared by all mail subcommands (--attach, --cc, --bcc, --html, --dry-run, --draft).
@@ -2678,6 +2818,61 @@ mod tests {
             .unwrap();
         let read = matches.subcommand_matches("+read").unwrap();
         assert_eq!(read.get_one::<String>("format").unwrap(), "json");
+    }
+
+    #[test]
+    fn test_render_message_preview_decodes_parts() {
+        let long_line = "é".repeat(120);
+        let to = Mailbox::parse_list("bob@example.com");
+        let mb = mail_builder::MessageBuilder::new()
+            .to(to_mb_address_list(&to))
+            .subject("Café meeting");
+        let attachments = [Attachment {
+            filename: "report.pdf".to_string(),
+            content_type: "application/pdf".to_string(),
+            data: vec![0u8; 3000],
+            content_id: None,
+        }];
+        let body = format!("Hello Bob,\n\nSee you at the Café.\n{long_line}\n");
+        let raw = finalize_message(mb, body, false, &attachments).unwrap();
+        // Precondition: the wire format really is encoded.
+        assert!(!raw.contains("See you at the Café."));
+
+        let preview = render_message_preview(&raw);
+        assert!(preview.contains("To: <bob@example.com>"), "{preview}");
+        assert!(preview.contains("Subject: "), "{preview}");
+        assert!(
+            preview.contains("Hello Bob,\n\nSee you at the Café.\n"),
+            "{preview}"
+        );
+        assert!(preview.contains(&long_line), "{preview}");
+        assert!(preview.contains("report.pdf"), "{preview}");
+        assert!(preview.contains("[3000 bytes omitted]"), "{preview}");
+        assert!(!preview.contains("AAAAAAAA"), "{preview}");
+        assert!(!preview.contains('\r'));
+    }
+
+    #[test]
+    fn test_render_message_preview_html_alternative() {
+        let to = Mailbox::parse_list("bob@example.com");
+        let mb = mail_builder::MessageBuilder::new()
+            .to(to_mb_address_list(&to))
+            .subject("Hello")
+            .text_body("Plain café")
+            .html_body("<p>Rich café</p>");
+        let raw = mb.write_to_string().unwrap();
+        let preview = render_message_preview(&raw);
+        assert!(preview.contains("Plain café"), "{preview}");
+        assert!(preview.contains("<p>Rich café</p>"), "{preview}");
+    }
+
+    #[test]
+    fn test_decode_quoted_printable() {
+        assert_eq!(
+            decode_quoted_printable("Caf=C3=A9 =3D ok=\r\nsoft"),
+            "Café = oksoft".as_bytes()
+        );
+        assert_eq!(decode_quoted_printable("a=ZZb="), b"a=ZZb=");
     }
 
     #[test]

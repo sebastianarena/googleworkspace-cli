@@ -23,31 +23,30 @@ pub(super) async fn handle_reply(
     let mut config = parse_reply_args(matches)?;
     let dry_run = matches.get_flag("dry-run");
 
-    let (original, token, own_emails, client) = if dry_run {
-        (
-            OriginalMessage::dry_run_placeholder(&config.message_id),
-            None,
-            Vec::new(),
-            None,
-        )
-    } else {
-        let t = auth::get_token(&[GMAIL_SCOPE])
-            .await
-            .map_err(|e| GwsError::Auth(format!("Gmail auth failed: {e}")))?;
+    // A dry run still fetches the original (read-only) when logged in, so the
+    // preview shows the real recipients and quoted text.
+    let token = get_token_or_dry_run(&[GMAIL_SCOPE], dry_run).await?;
+    let (original, own_emails, client) = if let Some(t) = &token {
         let c = crate::client::build_client()?;
-        let orig = fetch_message_metadata(&c, &t, &config.message_id).await?;
-        let sender = resolve_sender_and_identities(&c, &t, config.from.as_deref()).await?;
+        let orig = fetch_message_metadata(&c, t, &config.message_id).await?;
+        let sender = resolve_sender_and_identities(&c, t, config.from.as_deref()).await?;
         config.from = sender.from;
         // Every address of the account (primary and all send-as aliases) is
         // "you", both for self-reply detection and for reply-all exclusion.
         let mut own = sender.own_emails;
         if own.is_empty() {
-            own.push(fetch_user_email(&c, &t).await?);
+            own.push(fetch_user_email(&c, t).await?);
         }
         if let Some(from) = &config.from {
             own.extend(from.iter().map(|m| m.email.clone()));
         }
-        (orig, Some(t), own, Some(c))
+        (orig, own, Some(c))
+    } else {
+        (
+            OriginalMessage::dry_run_placeholder(&config.message_id),
+            Vec::new(),
+            None,
+        )
     };
 
     let own_emails: Vec<&str> = own_emails.iter().map(String::as_str).collect();
@@ -99,7 +98,9 @@ pub(super) async fn handle_reply(
     // images are dropped entirely — matching Gmail web, which strips them from
     // both plain-text replies and plain-text forwards.
     let mut all_attachments = config.attachments;
-    if let (true, Some(client), Some(token)) = (config.html, &client, &token) {
+    if dry_run && config.html && original.parts.iter().any(|p| p.is_inline()) {
+        eprintln!("Note: inline images not included in dry-run preview");
+    } else if let (true, Some(client), Some(token)) = (config.html, &client, &token) {
         let inline_parts: Vec<_> = original
             .parts
             .iter()

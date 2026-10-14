@@ -166,8 +166,9 @@ pub(super) struct OriginalPart {
 }
 
 impl OriginalPart {
-    /// Whether this part is an inline image (has a Content-ID and is not explicitly
-    /// `Content-Disposition: attachment`) vs a regular file attachment.
+    /// Whether this part is an inline image vs a regular file attachment.
+    /// `parse_original_message` keeps a Content-ID only on images that the HTML
+    /// body references via `cid:`.
     pub fn is_inline(&self) -> bool {
         self.content_id.is_some()
     }
@@ -331,11 +332,28 @@ fn parse_original_message(msg: &Value) -> Result<OriginalMessage, GwsError> {
     let PayloadContents {
         body_text: extracted_text,
         body_html,
-        parts: original_parts,
+        parts: mut original_parts,
     } = msg
         .get("payload")
         .map(extract_payload_contents)
         .unwrap_or_default();
+
+    // Gmail and other clients give Content-IDs to plain attachments too, so a
+    // part is inline only when it is an image the HTML body actually shows.
+    let referenced_cids = body_html
+        .as_deref()
+        .map(html_cid_references)
+        .unwrap_or_default();
+    for part in &mut original_parts {
+        let shown = part.content_type.to_ascii_lowercase().starts_with("image/")
+            && part
+                .content_id
+                .as_ref()
+                .is_some_and(|cid| referenced_cids.contains(&cid.to_lowercase()));
+        if !shown {
+            part.content_id = None;
+        }
+    }
 
     // The snippet is a ~200-character preview, so it is the last resort: an
     // HTML-only message gets its plain text rendered from the HTML part.
@@ -1084,6 +1102,24 @@ pub(super) fn resolve_html_body(original: &OriginalMessage) -> String {
             .collect::<Vec<_>>()
             .join("<br>\r\n"),
     }
+}
+
+/// Collect the (percent-decoded, lowercased) Content-IDs referenced by `cid:`
+/// URLs in an HTML body.
+fn html_cid_references(html: &str) -> std::collections::HashSet<String> {
+    let lower = html.to_ascii_lowercase();
+    lower
+        .match_indices("cid:")
+        .map(|(i, _)| {
+            let rest = &html[i + 4..];
+            let end = rest
+                .find(|c: char| matches!(c, '"' | '\'' | '>' | ')' | '<') || c.is_whitespace())
+                .unwrap_or(rest.len());
+            percent_encoding::percent_decode_str(&rest[..end])
+                .decode_utf8_lossy()
+                .to_lowercase()
+        })
+        .collect()
 }
 
 /// Render an HTML body as plain text: links become numbered footnotes and
@@ -4212,12 +4248,63 @@ mod tests {
         assert_eq!(original.parts[0].filename, "report.pdf");
         assert!(!original.parts[0].is_inline());
         assert_eq!(original.parts[0].attachment_id, "ATT1");
-        // Second part: inline image
+        // Second part: has a Content-ID, but no HTML body references it, so it
+        // is a regular attachment too.
         assert_eq!(original.parts[1].filename, "photo.png");
-        assert!(original.parts[1].is_inline());
+        assert!(!original.parts[1].is_inline());
+    }
+
+    #[test]
+    fn test_parse_original_message_inline_only_when_html_references_image() {
+        let html = "<p>Chart: <img src=\"CID:Chart%401@example.com\"> and \
+                    <img src='cid:notes@example.com'></p>";
+        let part = |mime: &str, name: &str, id: &str, cid: &str| {
+            json!({
+                "mimeType": mime,
+                "filename": name,
+                "body": { "attachmentId": id, "size": 100 },
+                "headers": [{ "name": "Content-ID", "value": format!("<{cid}>") }]
+            })
+        };
+        let msg = json!({
+            "threadId": "thread1",
+            "payload": {
+                "mimeType": "multipart/mixed",
+                "headers": [
+                    { "name": "From", "value": "alice@example.com" },
+                    { "name": "Message-ID", "value": "<msg1@example.com>" },
+                ],
+                "parts": [
+                    {
+                        "mimeType": "multipart/related",
+                        "parts": [
+                            { "mimeType": "text/html", "body": { "data": base64url(html) } },
+                            part("image/png", "chart.png", "ATT1", "chart@1@example.com"),
+                            part("image/png", "unused.png", "ATT2", "unused@example.com"),
+                        ]
+                    },
+                    part("application/pdf", "notes.pdf", "ATT3", "notes@example.com"),
+                ]
+            }
+        });
+        let original = parse_original_message(&msg).unwrap();
+        let inline: Vec<_> = original
+            .parts
+            .iter()
+            .map(|p| (p.filename.as_str(), p.is_inline()))
+            .collect();
         assert_eq!(
-            original.parts[1].content_id.as_deref(),
-            Some("img1@example.com")
+            inline,
+            vec![
+                ("chart.png", true),
+                ("unused.png", false),
+                // Referenced, but not an image: forwarded as an attachment.
+                ("notes.pdf", false),
+            ]
+        );
+        assert_eq!(
+            original.parts[0].content_id.as_deref(),
+            Some("chart@1@example.com")
         );
     }
 

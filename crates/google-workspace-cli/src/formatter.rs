@@ -67,24 +67,57 @@ pub fn format_value(value: &Value, format: &OutputFormat) -> String {
     }
 }
 
-/// Format a JSON value for a paginated page.
+/// Formats the pages of a `--page-all` stream.
 ///
-/// When auto-paginating with `--page-all`, CSV and table formats should only
-/// emit column headers on the **first** page so that each subsequent page
-/// contains only data rows, making the combined output machine-parseable.
+/// CSV and table output emit column headers once, and the columns (and table
+/// widths) chosen for the first page with rows are reused for every later
+/// page, so rows stay aligned with the header. Fields missing on a later page
+/// render empty; fields that first appear on a later page are dropped.
 ///
 /// For JSON the output is compact (one JSON object per line / NDJSON).
 /// For YAML each page is prefixed with a `---` document separator so the
 /// combined stream is a valid YAML multi-document file.
-pub fn format_value_paginated(value: &Value, format: &OutputFormat, is_first_page: bool) -> String {
-    match format {
-        OutputFormat::Json => serde_json::to_string(value).unwrap_or_default(),
-        OutputFormat::Csv => format_csv_page(value, is_first_page),
-        OutputFormat::Table => format_table_page(value, is_first_page),
-        // Prefix every page with a YAML document separator so that the
-        // concatenated stream is parseable as a multi-document YAML file.
-        OutputFormat::Yaml => format!("---\n{}", format_yaml(value)),
+pub struct PageFormatter {
+    format: OutputFormat,
+    csv_columns: Option<Vec<String>>,
+    table_layout: Option<TableLayout>,
+}
+
+impl PageFormatter {
+    pub fn new(format: &OutputFormat) -> Self {
+        Self {
+            format: format.clone(),
+            csv_columns: None,
+            table_layout: None,
+        }
     }
+
+    pub fn format_page(&mut self, value: &Value) -> String {
+        match self.format {
+            OutputFormat::Json => serde_json::to_string(value).unwrap_or_default(),
+            OutputFormat::Csv => {
+                let (out, columns) = format_csv_page(value, self.csv_columns.as_deref());
+                if self.csv_columns.is_none() {
+                    self.csv_columns = columns;
+                }
+                out
+            }
+            OutputFormat::Table => {
+                let (out, layout) = format_table_page(value, self.table_layout.as_ref());
+                if self.table_layout.is_none() {
+                    self.table_layout = layout;
+                }
+                out
+            }
+            OutputFormat::Yaml => format!("---\n{}", format_yaml(value)),
+        }
+    }
+}
+
+/// Column names and widths of a rendered table.
+struct TableLayout {
+    columns: Vec<String>,
+    widths: Vec<usize>,
 }
 
 /// Extract a "data array" from a typical Google API list response.
@@ -174,7 +207,7 @@ fn extract_items(value: &Value) -> Option<(&str, &Vec<Value>)> {
 }
 
 fn format_table(value: &Value) -> String {
-    format_table_page(value, true)
+    format_table_page(value, None).0
 }
 
 /// Recursively flatten a JSON object into `(dot.notation.key, string_value)` pairs.
@@ -201,19 +234,19 @@ fn flatten_object(obj: &serde_json::Map<String, Value>, prefix: &str) -> Vec<(St
     out
 }
 
-/// Format as a text table, optionally omitting the header row.
+/// Format as a text table.
 ///
-/// Pass `emit_header = false` for continuation pages when using `--page-all`
-/// so the combined terminal output doesn't repeat column names and separator
-/// lines between pages.
-fn format_table_page(value: &Value, emit_header: bool) -> String {
+/// With `layout` (a continuation page under `--page-all`) the rows are
+/// rendered against those columns and widths, without a header. Returns the
+/// layout used, if the value rendered as rows.
+fn format_table_page(value: &Value, layout: Option<&TableLayout>) -> (String, Option<TableLayout>) {
     // Try to extract a list of items from standard Google API response
     let items = extract_items(value);
 
     if let Some((_key, arr)) = items {
-        format_array_as_table(arr, emit_header)
+        format_array_as_table(arr, layout)
     } else if let Value::Array(arr) = value {
-        format_array_as_table(arr, emit_header)
+        format_array_as_table(arr, layout)
     } else if let Value::Object(obj) = value {
         // Single object: key/value table — flatten nested objects first
         let mut output = String::new();
@@ -222,15 +255,18 @@ fn format_table_page(value: &Value, emit_header: bool) -> String {
         for (key, val_str) in &flat {
             let _ = writeln!(output, "{:width$}  {}", key, val_str, width = max_key_len);
         }
-        output
+        (output, None)
     } else {
-        value.to_string()
+        (value.to_string(), None)
     }
 }
 
-fn format_array_as_table(arr: &[Value], emit_header: bool) -> String {
+fn format_array_as_table(
+    arr: &[Value],
+    layout: Option<&TableLayout>,
+) -> (String, Option<TableLayout>) {
     if arr.is_empty() {
-        return "(empty)\n".to_string();
+        return ("(empty)\n".to_string(), None);
     }
 
     // Flatten each row so nested objects become dot-notation columns.
@@ -244,10 +280,14 @@ fn format_array_as_table(arr: &[Value], emit_header: bool) -> String {
 
     // Collect all unique column names (preserving insertion order).
     let mut columns: Vec<String> = Vec::new();
-    for row in &flat_rows {
-        for (key, _) in row {
-            if !columns.contains(key) {
-                columns.push(key.clone());
+    if let Some(layout) = layout {
+        columns.clone_from(&layout.columns);
+    } else {
+        for row in &flat_rows {
+            for (key, _) in row {
+                if !columns.contains(key) {
+                    columns.push(key.clone());
+                }
             }
         }
     }
@@ -258,7 +298,7 @@ fn format_array_as_table(arr: &[Value], emit_header: bool) -> String {
         for item in arr {
             let _ = writeln!(output, "{}", value_to_cell(item));
         }
-        return output;
+        return (output, None);
     }
 
     // Build lookup: row_index -> column_name -> cell_value
@@ -272,8 +312,13 @@ fn format_array_as_table(arr: &[Value], emit_header: bool) -> String {
         })
         .collect();
 
-    // Calculate column widths (char-count, not byte-count).
-    let mut widths: Vec<usize> = columns.iter().map(|c| c.chars().count()).collect();
+    // Calculate column widths (char-count, not byte-count). A fixed layout
+    // keeps the first page's widths so later pages stay aligned.
+    let fixed_widths = layout.is_some();
+    let mut widths: Vec<usize> = match layout {
+        Some(layout) => layout.widths.clone(),
+        None => columns.iter().map(|c| c.chars().count()).collect(),
+    };
     let rows: Vec<Vec<String>> = row_maps
         .iter()
         .map(|row| {
@@ -283,12 +328,14 @@ fn format_array_as_table(arr: &[Value], emit_header: bool) -> String {
                 .map(|(i, col)| {
                     let cell = row.get(col.as_str()).copied().unwrap_or("").to_string();
                     let char_len = cell.chars().count();
-                    if char_len > widths[i] {
-                        widths[i] = char_len;
-                    }
-                    // Cap column width at 60 chars
-                    if widths[i] > 60 {
-                        widths[i] = 60;
+                    if !fixed_widths {
+                        if char_len > widths[i] {
+                            widths[i] = char_len;
+                        }
+                        // Cap column width at 60 chars
+                        if widths[i] > 60 {
+                            widths[i] = 60;
+                        }
                     }
                     cell
                 })
@@ -298,7 +345,7 @@ fn format_array_as_table(arr: &[Value], emit_header: bool) -> String {
 
     let mut output = String::new();
 
-    if emit_header {
+    if layout.is_none() {
         // Header
         let header: Vec<String> = columns
             .iter()
@@ -334,7 +381,7 @@ fn format_array_as_table(arr: &[Value], emit_header: bool) -> String {
         let _ = writeln!(output, "{}", cells.join("  "));
     }
 
-    output
+    (output, Some(TableLayout { columns, widths }))
 }
 
 fn format_yaml(value: &Value) -> String {
@@ -400,14 +447,18 @@ fn json_to_yaml(value: &Value, indent: usize) -> String {
 }
 
 fn format_csv(value: &Value) -> String {
-    format_csv_page(value, true)
+    format_csv_page(value, None).0
 }
 
-/// Format as CSV, optionally omitting the header row.
+/// Format as CSV.
 ///
-/// Pass `emit_header = false` for all pages after the first when using
-/// `--page-all`, so the combined output has a single header line.
-fn format_csv_page(value: &Value, emit_header: bool) -> String {
+/// With `fixed_columns` (a continuation page under `--page-all`) the rows are
+/// rendered against those columns, without a header. Returns the columns
+/// used, if the value rendered as object rows.
+fn format_csv_page(
+    value: &Value,
+    fixed_columns: Option<&[String]>,
+) -> (String, Option<Vec<String>>) {
     let items = extract_items(value);
 
     let arr = if let Some((_key, arr)) = items {
@@ -416,11 +467,11 @@ fn format_csv_page(value: &Value, emit_header: bool) -> String {
         arr.as_slice()
     } else {
         // Single value — just output it
-        return value_to_cell(value);
+        return (value_to_cell(value), None);
     };
 
     if arr.is_empty() {
-        return String::new();
+        return (String::new(), None);
     }
 
     // Array of non-objects
@@ -437,25 +488,31 @@ fn format_csv_page(value: &Value, emit_header: bool) -> String {
                 let _ = writeln!(output, "{}", csv_escape(&value_to_cell(item)));
             }
         }
-        return output;
+        return (output, None);
     }
 
     // Collect columns
-    let mut columns: Vec<String> = Vec::new();
-    for item in arr {
-        if let Value::Object(obj) = item {
-            for key in obj.keys() {
-                if !columns.contains(key) {
-                    columns.push(key.clone());
+    let columns: Vec<String> = match fixed_columns {
+        Some(fixed) => fixed.to_vec(),
+        None => {
+            let mut columns = Vec::new();
+            for item in arr {
+                if let Value::Object(obj) = item {
+                    for key in obj.keys() {
+                        if !columns.contains(key) {
+                            columns.push(key.clone());
+                        }
+                    }
                 }
             }
+            columns
         }
-    }
+    };
 
     let mut output = String::new();
 
     // Header (omitted on continuation pages)
-    if emit_header {
+    if fixed_columns.is_none() {
         let _ = writeln!(output, "{}", columns.join(","));
     }
 
@@ -474,7 +531,7 @@ fn format_csv_page(value: &Value, emit_header: bool) -> String {
         let _ = writeln!(output, "{}", cells.join(","));
     }
 
-    output
+    (output, Some(columns))
 }
 
 fn csv_escape(s: &str) -> String {
@@ -812,6 +869,36 @@ mod tests {
     // --- Paginated format tests ---
 
     #[test]
+    fn test_page_formatter_keeps_page_one_columns() {
+        let page1 = json!({"files": [{"id": "1", "name": "a.txt"}]});
+        // Page 2 lacks `name`, adds `size`, and its keys sort differently.
+        let page2 = json!({"files": [{"id": "2", "size": "10"}]});
+
+        let mut csv = PageFormatter::new(&OutputFormat::Csv);
+        assert_eq!(csv.format_page(&page1), "id,name\n1,a.txt\n");
+        assert_eq!(csv.format_page(&page2), "2,\n");
+
+        let mut table = PageFormatter::new(&OutputFormat::Table);
+        let first = table.format_page(&page1);
+        let second = table.format_page(&page2);
+        let header = first.lines().next().unwrap();
+        assert!(
+            header.starts_with("id") && header.contains("name"),
+            "{first}"
+        );
+        assert!(!second.contains("10"), "unknown column leaked: {second}");
+        assert!(!second.contains("──"), "{second}");
+        // Same column widths as page 1.
+        let row1 = first.lines().nth(2).unwrap();
+        let row2 = second.lines().next().unwrap();
+        assert_eq!(
+            row1.chars().count(),
+            row2.chars().count(),
+            "{first}{second}"
+        );
+    }
+
+    #[test]
     fn test_format_value_paginated_csv_first_page_has_header() {
         let val = json!({
             "files": [
@@ -819,7 +906,7 @@ mod tests {
                 {"id": "2", "name": "b.txt"}
             ]
         });
-        let output = format_value_paginated(&val, &OutputFormat::Csv, true);
+        let output = PageFormatter::new(&OutputFormat::Csv).format_page(&val);
         let lines: Vec<&str> = output.lines().collect();
         assert_eq!(lines[0], "id,name", "first page must start with header");
         assert_eq!(lines[1], "1,a.txt");
@@ -832,7 +919,9 @@ mod tests {
                 {"id": "3", "name": "c.txt"}
             ]
         });
-        let output = format_value_paginated(&val, &OutputFormat::Csv, false);
+        let mut pages = PageFormatter::new(&OutputFormat::Csv);
+        pages.format_page(&json!({"files": [{"id": "1", "name": "a.txt"}]}));
+        let output = pages.format_page(&val);
         let lines: Vec<&str> = output.lines().collect();
         // The first (and only) line must be a data row, not the header.
         assert_eq!(lines[0], "3,c.txt", "continuation page must have no header");
@@ -849,7 +938,7 @@ mod tests {
                 {"id": "1", "name": "foo"}
             ]
         });
-        let output = format_value_paginated(&val, &OutputFormat::Table, true);
+        let output = PageFormatter::new(&OutputFormat::Table).format_page(&val);
         assert!(
             output.contains("id"),
             "table header must appear on first page"
@@ -864,7 +953,9 @@ mod tests {
                 {"id": "2", "name": "bar"}
             ]
         });
-        let output = format_value_paginated(&val, &OutputFormat::Table, false);
+        let mut pages = PageFormatter::new(&OutputFormat::Table);
+        pages.format_page(&json!({"items": [{"id": "1", "name": "foo"}]}));
+        let output = pages.format_page(&val);
         assert!(output.contains("bar"), "data row must be present");
         assert!(
             !output.contains("──"),
@@ -875,8 +966,9 @@ mod tests {
     #[test]
     fn test_format_value_paginated_yaml_has_document_separator() {
         let val = json!({"files": [{"id": "1", "name": "foo"}]});
-        let first = format_value_paginated(&val, &OutputFormat::Yaml, true);
-        let second = format_value_paginated(&val, &OutputFormat::Yaml, false);
+        let mut pages = PageFormatter::new(&OutputFormat::Yaml);
+        let first = pages.format_page(&val);
+        let second = pages.format_page(&val);
         assert!(
             first.starts_with("---\n"),
             "first YAML page must start with ---"

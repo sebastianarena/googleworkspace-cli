@@ -268,6 +268,7 @@ async fn handle_json_response(
     sanitize_template: Option<&str>,
     sanitize_mode: &crate::helpers::modelarmor::SanitizeMode,
     output_format: &crate::formatter::OutputFormat,
+    page_formatter: &mut crate::formatter::PageFormatter,
     pages_fetched: &mut u32,
     page_token: &mut Option<String>,
     capture_output: bool,
@@ -320,11 +321,7 @@ async fn handle_json_response(
         if capture_output {
             captured.push(json_val.clone());
         } else if pagination.page_all {
-            let is_first_page = *pages_fetched == 1;
-            println!(
-                "{}",
-                crate::formatter::format_value_paginated(&json_val, output_format, is_first_page)
-            );
+            println!("{}", page_formatter.format_page(&json_val));
         } else {
             println!(
                 "{}",
@@ -459,6 +456,7 @@ pub async fn execute_method(
     let mut page_token: Option<String> = None;
     let mut pages_fetched: u32 = 0;
     let mut captured_values = Vec::new();
+    let mut page_formatter = crate::formatter::PageFormatter::new(output_format);
 
     loop {
         let client = crate::client::build_client()?;
@@ -525,6 +523,7 @@ pub async fn execute_method(
                 sanitize_template,
                 sanitize_mode,
                 output_format,
+                &mut page_formatter,
                 &mut pages_fetched,
                 &mut page_token,
                 capture_output,

@@ -383,11 +383,7 @@ async fn handle_agenda(matches: &ArgMatches) -> Result<(), GwsError> {
         .await;
 
     // 3. Sort by start time
-    all_events.sort_by(|a, b| {
-        let a_start = a.get("start").and_then(|v| v.as_str()).unwrap_or("");
-        let b_start = b.get("start").and_then(|v| v.as_str()).unwrap_or("");
-        a_start.cmp(b_start)
-    });
+    sort_events(&mut all_events, tz);
 
     let output = json!({
         "events": all_events,
@@ -401,6 +397,30 @@ async fn handle_agenda(matches: &ArgMatches) -> Result<(), GwsError> {
         crate::formatter::format_value(&output, &output_format)
     );
     Ok(())
+}
+
+/// Parse an event start (RFC3339 `dateTime`, or all-day `date` taken as the
+/// start of that day in `tz`) into an instant.
+fn event_start_instant(start: &str, tz: Tz) -> Option<DateTime<Utc>> {
+    if let Ok(dt) = DateTime::parse_from_rfc3339(start) {
+        return Some(dt.with_timezone(&Utc));
+    }
+    let date = chrono::NaiveDate::parse_from_str(start, "%Y-%m-%d").ok()?;
+    crate::timezone::start_of_day(tz, date)
+        .ok()
+        .map(|dt| dt.with_timezone(&Utc))
+}
+
+/// Sort by start instant; offsets differ between events, so the strings
+/// don't sort chronologically. Unparseable starts go last.
+fn sort_events(events: &mut [Value], tz: Tz) {
+    events.sort_by_cached_key(|e| {
+        let instant = e
+            .get("start")
+            .and_then(|v| v.as_str())
+            .and_then(|s| event_start_instant(s, tz));
+        (instant.is_none(), instant)
+    });
 }
 
 fn events_list_query<'a>(
@@ -773,6 +793,33 @@ mod tests {
         );
         assert!(query.contains(&("timeZone", "America/Denver")));
         assert!(query.contains(&("timeMin", "2026-10-20T00:00:00-06:00")));
+    }
+
+    #[test]
+    fn agenda_sorts_by_instant_not_string() {
+        let mut events: Vec<Value> = [
+            "2026-10-20T09:00:00-04:00", // 13:00Z
+            "2026-10-20T08:00:00-06:00", // 14:00Z
+            "2026-10-20",                // all-day, 06:00Z in Denver
+            "2026-10-20T10:00:00Z",
+        ]
+        .iter()
+        .map(|start| json!({ "start": start, "summary": start }))
+        .collect();
+        sort_events(&mut events, chrono_tz::America::Denver);
+        let order: Vec<&str> = events
+            .iter()
+            .map(|e| e["start"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            order,
+            [
+                "2026-10-20",
+                "2026-10-20T10:00:00Z",
+                "2026-10-20T09:00:00-04:00",
+                "2026-10-20T08:00:00-06:00",
+            ]
+        );
     }
 
     fn agenda_range_at(range: AgendaRange, now: &str) -> (String, String) {

@@ -868,8 +868,11 @@ async fn resolve_scopes(
             }
         }
 
-        // Fallback: simple scope picker using static SCOPE_ENTRIES
-        if let Some(selected) = run_simple_scope_picker(services_filter) {
+        // Fallback: simple scope picker using static SCOPE_ENTRIES. Services it has
+        // no entries for (e.g. chat) were never offered, so add their scopes the
+        // same way the non-interactive path does.
+        if let Some(mut selected) = run_simple_scope_picker(services_filter) {
+            augment_with_dynamic_scopes(&mut selected, services_filter, false).await;
             return selected;
         }
     }

@@ -964,7 +964,7 @@ fn run_discovery_scope_picker(
     relevant_scopes: &[crate::setup::DiscoveredScope],
     services_filter: Option<&HashSet<String>>,
 ) -> Option<Vec<String>> {
-    use crate::setup::{ScopeClassification, PLATFORM_SCOPE};
+    use crate::setup::ScopeClassification;
     use crate::setup_tui::{PickerResult, SelectItem};
 
     let mut recommended_scopes = vec![];
@@ -1136,36 +1136,7 @@ fn run_discovery_scope_picker(
                 }
             }
 
-            // Always include cloud-platform scope
-            if !selected.contains(&PLATFORM_SCOPE.to_string()) {
-                selected.push(PLATFORM_SCOPE.to_string());
-            }
-
-            // Hierarchical dedup: if we have both a broad scope (e.g. `.../auth/drive`)
-            // and a narrower scope (e.g. `.../auth/drive.metadata`, `.../auth/drive.readonly`),
-            // drop the narrower one since the broad scope subsumes it.
-            let prefix = "https://www.googleapis.com/auth/";
-            let shorts: Vec<&str> = selected
-                .iter()
-                .filter_map(|s| s.strip_prefix(prefix))
-                .collect();
-
-            let mut deduplicated: Vec<String> = Vec::new();
-            for scope in &selected {
-                if let Some(short) = scope.strip_prefix(prefix) {
-                    // Check if any OTHER selected scope is a prefix of this one
-                    // e.g. "drive" is a prefix of "drive.metadata" → drop "drive.metadata"
-                    let is_subsumed = shorts.iter().any(|&other| {
-                        other != short
-                            && short.starts_with(other)
-                            && short.as_bytes().get(other.len()) == Some(&b'.')
-                    });
-                    if is_subsumed {
-                        continue;
-                    }
-                }
-                deduplicated.push(scope.clone());
-            }
+            let deduplicated = finalize_picker_scopes(selected, full);
 
             if deduplicated.len() > 30 {
                 eprintln!(
@@ -1182,6 +1153,47 @@ fn run_discovery_scope_picker(
         }
         _ => None, // GoBack, Cancelled, or error
     }
+}
+
+/// Post-process the scopes chosen in the discovery picker.
+///
+/// `cloud-platform` is added only for the Full Access template. Adding it to
+/// every login put Workspace accounts under Google Cloud session control, which
+/// forces a re-login on a timer (`invalid_rapt`) however often the token is used.
+///
+/// Hierarchical dedup: if both a broad scope (e.g. `.../auth/drive`) and a
+/// narrower one (e.g. `.../auth/drive.readonly`) are selected, the narrower one
+/// is dropped since the broad scope subsumes it.
+fn finalize_picker_scopes(mut selected: Vec<String>, full: bool) -> Vec<String> {
+    use crate::setup::PLATFORM_SCOPE;
+
+    if full && !selected.iter().any(|s| s == PLATFORM_SCOPE) {
+        selected.push(PLATFORM_SCOPE.to_string());
+    }
+
+    let prefix = "https://www.googleapis.com/auth/";
+    let shorts: Vec<&str> = selected
+        .iter()
+        .filter_map(|s| s.strip_prefix(prefix))
+        .collect();
+
+    let mut deduplicated: Vec<String> = Vec::new();
+    for scope in &selected {
+        if let Some(short) = scope.strip_prefix(prefix) {
+            // Check if any OTHER selected scope is a prefix of this one
+            // e.g. "drive" is a prefix of "drive.metadata" → drop "drive.metadata"
+            let is_subsumed = shorts.iter().any(|&other| {
+                other != short
+                    && short.starts_with(other)
+                    && short.as_bytes().get(other.len()) == Some(&b'.')
+            });
+            if is_subsumed {
+                continue;
+            }
+        }
+        deduplicated.push(scope.clone());
+    }
+    deduplicated
 }
 
 /// Run the simple static scope picker (fallback when no project_id available).
@@ -1862,6 +1874,30 @@ mod tests {
             let err_msg = result.unwrap_err().to_string();
             assert!(err_msg.contains("No OAuth client configured"));
         }
+    }
+
+    #[test]
+    fn finalize_picker_scopes_adds_cloud_platform_only_for_full_access() {
+        let gmail = "https://www.googleapis.com/auth/gmail.modify".to_string();
+        let platform = crate::setup::PLATFORM_SCOPE;
+
+        let recommended = finalize_picker_scopes(vec![gmail.clone()], false);
+        assert_eq!(recommended, vec![gmail.clone()]);
+
+        let full = finalize_picker_scopes(vec![gmail.clone()], true);
+        assert!(full.iter().any(|s| s == platform));
+    }
+
+    #[test]
+    fn finalize_picker_scopes_drops_narrower_duplicates() {
+        let scopes = finalize_picker_scopes(
+            vec![
+                "https://www.googleapis.com/auth/drive".to_string(),
+                "https://www.googleapis.com/auth/drive.readonly".to_string(),
+            ],
+            false,
+        );
+        assert_eq!(scopes, vec!["https://www.googleapis.com/auth/drive"]);
     }
 
     #[test]

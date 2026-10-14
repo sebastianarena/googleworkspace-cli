@@ -378,7 +378,8 @@ async fn handle_meeting_prep(matches: &ArgMatches) -> Result<(), GwsError> {
 
     // Use account timezone for current time
     let tz = crate::timezone::resolve_account_timezone(&client, &token, None).await?;
-    let now_rfc = chrono::Utc::now().with_timezone(&tz).to_rfc3339();
+    let now = chrono::Utc::now();
+    let now_rfc = now.with_timezone(&tz).to_rfc3339();
 
     let events_url = format!(
         "https://www.googleapis.com/calendar/v3/calendars/{}/events",
@@ -392,7 +393,7 @@ async fn handle_meeting_prep(matches: &ArgMatches) -> Result<(), GwsError> {
             ("timeMin", now_rfc.as_str()),
             ("singleEvents", "true"),
             ("orderBy", "startTime"),
-            ("maxResults", "1"),
+            ("maxResults", "25"),
         ],
     )
     .await?;
@@ -402,13 +403,12 @@ async fn handle_meeting_prep(matches: &ArgMatches) -> Result<(), GwsError> {
         .cloned()
         .unwrap_or_default();
 
-    if items.is_empty() {
+    let Some(event) = next_meeting(&items, now) else {
         let output = json!({ "message": "No upcoming meetings found." });
         format_and_print(&output, matches);
         return Ok(());
-    }
+    };
 
-    let event = &items[0];
     let attendees = event
         .get("attendees")
         .and_then(|a| a.as_array())
@@ -695,6 +695,19 @@ async fn handle_file_announce(matches: &ArgMatches) -> Result<(), GwsError> {
 
 // (epoch_to_rfc3339 removed — replaced by account timezone resolution)
 
+/// First timed event that hasn't started yet. events.list with timeMin=now
+/// also returns all-day events and meetings already in progress.
+fn next_meeting(items: &[Value], now: chrono::DateTime<chrono::Utc>) -> Option<&Value> {
+    items.iter().find(|event| {
+        event
+            .get("start")
+            .and_then(|s| s.get("dateTime"))
+            .and_then(|v| v.as_str())
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .is_some_and(|start| start >= now)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -733,6 +746,22 @@ mod tests {
     fn test_build_meeting_prep_cmd() {
         let cmd = build_meeting_prep_cmd();
         assert_eq!(cmd.get_name(), "+meeting-prep");
+    }
+
+    #[test]
+    fn next_meeting_skips_all_day_and_in_progress_events() {
+        let items = vec![
+            json!({ "summary": "Holiday", "start": { "date": "2026-10-20" } }),
+            json!({ "summary": "Standup", "start": { "dateTime": "2026-10-20T09:00:00-06:00" } }),
+            json!({ "summary": "Review", "start": { "dateTime": "2026-10-20T11:00:00-06:00" } }),
+        ];
+        let now = chrono::DateTime::parse_from_rfc3339("2026-10-20T10:00:00-06:00")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let event = next_meeting(&items, now).unwrap();
+        assert_eq!(event["summary"], "Review");
+
+        assert!(next_meeting(&items[..2], now).is_none());
     }
 
     #[test]

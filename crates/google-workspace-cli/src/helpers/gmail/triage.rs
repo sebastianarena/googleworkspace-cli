@@ -130,10 +130,11 @@ pub async fn handle_triage(matches: &ArgMatches) -> Result<(), GwsError> {
                     for h in headers {
                         let name = h.get("name").and_then(|v| v.as_str()).unwrap_or("");
                         let value = h.get("value").and_then(|v| v.as_str()).unwrap_or("");
-                        match name {
-                            "From" => from = value.to_string(),
-                            "Subject" => subject = value.to_string(),
-                            "Date" => date = value.to_string(),
+                        // Header names are case-insensitive (RFC 5322 §1.2.2).
+                        match name.to_ascii_lowercase().as_str() {
+                            "from" => from = value.to_string(),
+                            "subject" => subject = value.to_string(),
+                            "date" => date = value.to_string(),
                             _ => {}
                         }
                     }

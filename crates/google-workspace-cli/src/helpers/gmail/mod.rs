@@ -258,15 +258,17 @@ fn parse_message_headers(headers: &[Value]) -> ParsedMessageHeaders {
         let name = header.get("name").and_then(|v| v.as_str()).unwrap_or("");
         let value = header.get("value").and_then(|v| v.as_str()).unwrap_or("");
 
-        match name {
-            "From" => parsed.from = value.to_string(),
-            "Reply-To" => append_address_list_header_value(&mut parsed.reply_to, value),
-            "To" => append_address_list_header_value(&mut parsed.to, value),
-            "Cc" => append_address_list_header_value(&mut parsed.cc, value),
-            "Subject" => parsed.subject = value.to_string(),
-            "Date" => parsed.date = value.to_string(),
-            "Message-ID" | "Message-Id" => parsed.message_id = value.to_string(),
-            "References" => append_header_value(&mut parsed.references, value),
+        // Header names are case-insensitive (RFC 5322 §1.2.2) and Gmail returns
+        // them as the sender wrote them — Outlook sends `CC`, for one.
+        match name.to_ascii_lowercase().as_str() {
+            "from" => parsed.from = value.to_string(),
+            "reply-to" => append_address_list_header_value(&mut parsed.reply_to, value),
+            "to" => append_address_list_header_value(&mut parsed.to, value),
+            "cc" => append_address_list_header_value(&mut parsed.cc, value),
+            "subject" => parsed.subject = value.to_string(),
+            "date" => parsed.date = value.to_string(),
+            "message-id" => parsed.message_id = value.to_string(),
+            "references" => append_header_value(&mut parsed.references, value),
             _ => {}
         }
     }
@@ -2369,6 +2371,49 @@ mod tests {
         append_address_list_header_value(&mut header_value, "");
 
         assert_eq!(header_value, "alice@example.com, bob@example.com");
+    }
+
+    #[test]
+    fn test_parse_original_message_matches_header_names_case_insensitively() {
+        // Outlook sends `CC:`; other clients `TO:`, `Reply-to:`, `Message-Id:`.
+        // Header names are case-insensitive (RFC 5322 §1.2.2), and Gmail passes
+        // them through as received, so none of these may be dropped.
+        let msg = json!({
+            "threadId": "thread-123",
+            "payload": {
+                "mimeType": "text/plain",
+                "headers": [
+                    { "name": "FROM", "value": "alice@example.com" },
+                    { "name": "Reply-to", "value": "desk@example.com" },
+                    { "name": "TO", "value": "bob@example.com" },
+                    { "name": "CC", "value": "Carol Example <carol@example.com>" },
+                    { "name": "cc", "value": "erin@example.com" },
+                    { "name": "SUBJECT", "value": "Hello" },
+                    { "name": "DATE", "value": "Fri, 6 Mar 2026 12:00:00 +0000" },
+                    { "name": "Message-id", "value": "<msg@example.com>" },
+                    { "name": "REFERENCES", "value": "<ref-1@example.com>" }
+                ],
+                "body": { "data": URL_SAFE.encode("hi") }
+            }
+        });
+
+        let original = parse_original_message(&msg).unwrap();
+
+        assert_eq!(original.from.email, "alice@example.com");
+        assert_eq!(original.reply_to.unwrap()[0].email, "desk@example.com");
+        assert_eq!(original.to.len(), 1);
+        assert_eq!(original.to[0].email, "bob@example.com");
+        let cc = original.cc.unwrap();
+        assert_eq!(cc.len(), 2);
+        assert_eq!(cc[0].email, "carol@example.com");
+        assert_eq!(cc[1].email, "erin@example.com");
+        assert_eq!(original.subject, "Hello");
+        assert_eq!(
+            original.date.as_deref(),
+            Some("Fri, 6 Mar 2026 12:00:00 +0000")
+        );
+        assert_eq!(original.message_id, "msg@example.com");
+        assert_eq!(original.references, vec!["ref-1@example.com"]);
     }
 
     #[test]

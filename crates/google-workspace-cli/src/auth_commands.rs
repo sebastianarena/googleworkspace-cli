@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use std::collections::HashSet;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, ErrorKind, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 
@@ -345,6 +345,30 @@ fn token_cache_path() -> PathBuf {
     config_dir().join("token_cache.json")
 }
 
+fn token_cache_paths() -> Vec<PathBuf> {
+    vec![token_cache_path(), config_dir().join("sa_token_cache.json")]
+}
+
+fn remove_file_if_exists(path: &Path) -> Result<bool, GwsError> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(GwsError::Validation(crate::output::sanitize_for_terminal(
+            &format!("Failed to remove {}: {e}", path.display()),
+        ))),
+    }
+}
+
+fn clear_token_caches() -> Result<Vec<PathBuf>, GwsError> {
+    let mut removed = Vec::new();
+    for path in token_cache_paths() {
+        if remove_file_if_exists(&path)? {
+            removed.push(path);
+        }
+    }
+    Ok(removed)
+}
+
 /// Which scope set to use for login.
 enum ScopeMode {
     /// Use the default scopes (MINIMAL_SCOPES).
@@ -643,6 +667,16 @@ async fn handle_login_inner(
     // Save encrypted credentials
     let enc_path = credential_store::save_encrypted(&creds_str)
         .map_err(|e| GwsError::Auth(format!("Failed to encrypt credentials: {e}")))?;
+
+    // Access tokens in the cache may belong to the previous account or scope set.
+    // Force the next API call to mint a token from the newly saved credentials.
+    if let Err(e) = clear_token_caches() {
+        eprintln!(
+            "Warning: failed to clear token caches: {}",
+            crate::output::sanitize_for_terminal(&e.to_string())
+        );
+    }
+    crate::timezone::invalidate_cache();
 
     let output = json!({
         "status": "success",
@@ -1456,19 +1490,19 @@ async fn handle_status() -> Result<(), GwsError> {
 fn handle_logout() -> Result<(), GwsError> {
     let plain_path = plain_credentials_path();
     let enc_path = credential_store::encrypted_credentials_path();
-    let token_cache = token_cache_path();
-    let sa_token_cache = config_dir().join("sa_token_cache.json");
 
     let mut removed = Vec::new();
 
-    for path in [&enc_path, &plain_path, &token_cache, &sa_token_cache] {
-        if path.exists() {
-            std::fs::remove_file(path).map_err(|e| {
-                GwsError::Validation(format!("Failed to remove {}: {e}", path.display()))
-            })?;
+    for path in [&enc_path, &plain_path] {
+        if remove_file_if_exists(path)? {
             removed.push(path.display().to_string());
         }
     }
+    removed.extend(
+        clear_token_caches()?
+            .into_iter()
+            .map(|path| path.display().to_string()),
+    );
 
     // Invalidate cached account timezone (may belong to old account)
     crate::timezone::invalidate_cache();
@@ -1898,6 +1932,52 @@ mod tests {
         let path = token_cache_path();
         assert!(path.ends_with("token_cache.json"));
         assert!(path.starts_with(config_dir()));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn clear_token_caches_removes_user_and_service_account_caches() {
+        let dir = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("GOOGLE_WORKSPACE_CLI_CONFIG_DIR", dir.path());
+        }
+
+        let token_cache = dir.path().join("token_cache.json");
+        let sa_token_cache = dir.path().join("sa_token_cache.json");
+        let credentials = dir.path().join("credentials.enc");
+        std::fs::write(&token_cache, "{}").unwrap();
+        std::fs::write(&sa_token_cache, "{}").unwrap();
+        std::fs::write(&credentials, "{}").unwrap();
+
+        let removed = clear_token_caches().unwrap();
+
+        assert_eq!(removed.len(), 2);
+        assert!(!token_cache.exists());
+        assert!(!sa_token_cache.exists());
+        assert!(credentials.exists());
+
+        unsafe {
+            std::env::remove_var("GOOGLE_WORKSPACE_CLI_CONFIG_DIR");
+        }
+    }
+
+    #[test]
+    fn remove_file_if_exists_ignores_missing_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing-token-cache.json");
+
+        assert!(!remove_file_if_exists(&missing).unwrap());
+    }
+
+    #[test]
+    fn remove_file_if_exists_sanitizes_error_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad\u{1b}[31m-cache");
+        std::fs::create_dir(&path).unwrap();
+
+        let err = remove_file_if_exists(&path).unwrap_err().to_string();
+
+        assert!(!err.contains('\u{1b}'));
     }
 
     #[tokio::test]

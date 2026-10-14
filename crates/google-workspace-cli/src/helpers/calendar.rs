@@ -52,14 +52,14 @@ impl Helper for CalendarHelper {
                 .arg(
                     Arg::new("start")
                         .long("start")
-                        .help("Start time (ISO 8601, e.g., 2024-01-01T10:00:00Z)")
+                        .help("Start time (ISO 8601, e.g., 2024-01-01T10:00:00Z), or a date for an all-day event")
                         .required(true)
                         .value_name("TIME"),
                 )
                 .arg(
                     Arg::new("end")
                         .long("end")
-                        .help("End time (ISO 8601)")
+                        .help("End time (ISO 8601), or the day after the last day of an all-day event")
                         .required(true)
                         .value_name("TIME"),
                 )
@@ -88,14 +88,25 @@ impl Helper for CalendarHelper {
                         .help("Add a Google Meet video conference link")
                         .action(ArgAction::SetTrue),
                 )
+                .arg(
+                    Arg::new("timezone")
+                        .long("timezone")
+                        .alias("tz")
+                        .help("IANA timezone for times without an offset. Defaults to Google account timezone.")
+                        .value_name("TZ"),
+                )
                 .after_help("\
 EXAMPLES:
   gws calendar +insert --summary 'Standup' --start '2026-06-17T09:00:00-07:00' --end '2026-06-17T09:30:00-07:00'
+  gws calendar +insert --summary 'Standup' --start '2026-06-17T09:00' --end '2026-06-17T09:30'
+  gws calendar +insert --summary 'Offsite' --start 2026-06-17 --end 2026-06-18
   gws calendar +insert --summary 'Review' --start ... --end ... --attendee alice@example.com
   gws calendar +insert --summary 'Meet' --start ... --end ... --meet
 
 TIPS:
   Use RFC3339 format for times (e.g. 2026-06-17T09:00:00-07:00).
+  Times without an offset are in your Google account timezone (or --timezone).
+  Dates without a time create an all-day event; --end is exclusive.
   The --meet flag automatically adds a Google Meet link to the event."),
         );
         cmd = cmd.subcommand(
@@ -164,7 +175,8 @@ TIPS:
     ) -> Pin<Box<dyn Future<Output = Result<bool, GwsError>> + Send + 'a>> {
         Box::pin(async move {
             if let Some(matches) = matches.subcommand_matches("+insert") {
-                let (params_str, body_str, scopes) = build_insert_request(matches, doc)?;
+                let (mut params_str, mut body_str, scopes) =
+                    build_insert_request(matches, doc, None)?;
 
                 let scopes_str: Vec<&str> = scopes.iter().map(|s| s.as_str()).collect();
                 let (token, auth_method) = match auth::get_token(&scopes_str).await {
@@ -172,6 +184,20 @@ TIPS:
                     Err(_) if matches.get_flag("dry-run") => (None, executor::AuthMethod::None),
                     Err(e) => return Err(GwsError::Auth(format!("Calendar auth failed: {e}"))),
                 };
+
+                let start = matches.get_one::<String>("start").unwrap();
+                let end = matches.get_one::<String>("end").unwrap();
+                if needs_time_zone(start) || needs_time_zone(end) {
+                    let client = crate::client::build_client()?;
+                    let tz = crate::timezone::resolve_account_timezone(
+                        &client,
+                        token.as_deref().unwrap_or(""),
+                        matches.get_one::<String>("timezone").map(|s| s.as_str()),
+                    )
+                    .await?;
+                    (params_str, body_str, _) =
+                        build_insert_request(matches, doc, Some(tz.name()))?;
+                }
 
                 let events_res = doc.resources.get("events").ok_or_else(|| {
                     GwsError::Discovery("Resource 'events' not found".to_string())
@@ -528,9 +554,34 @@ fn agenda_time_range(
     }
 }
 
+/// True for a date-time without a UTC offset, which the API only accepts
+/// together with a `timeZone`.
+fn needs_time_zone(value: &str) -> bool {
+    ["%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%dT%H:%M"]
+        .iter()
+        .any(|fmt| chrono::NaiveDateTime::parse_from_str(value, fmt).is_ok())
+}
+
+fn is_date_only(value: &str) -> bool {
+    chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d").is_ok()
+}
+
+/// Build an EventDateTime: `date` for an all-day value, otherwise
+/// `dateTime`, plus `timeZone` when the value has no offset.
+fn event_time(value: &str, time_zone: Option<&str>) -> Value {
+    if is_date_only(value) {
+        return json!({ "date": value });
+    }
+    match time_zone {
+        Some(tz) if needs_time_zone(value) => json!({ "dateTime": value, "timeZone": tz }),
+        _ => json!({ "dateTime": value }),
+    }
+}
+
 fn build_insert_request(
     matches: &ArgMatches,
     doc: &crate::discovery::RestDescription,
+    time_zone: Option<&str>,
 ) -> Result<(String, String, Vec<String>), GwsError> {
     let calendar_id = matches.get_one::<String>("calendar").unwrap();
     let summary = matches.get_one::<String>("summary").unwrap();
@@ -550,11 +601,18 @@ fn build_insert_request(
         .get("insert")
         .ok_or_else(|| GwsError::Discovery("Method 'events.insert' not found".to_string()))?;
 
+    if is_date_only(start) != is_date_only(end) {
+        return Err(GwsError::Validation(
+            "--start and --end must both be dates (all-day event) or both be date-times"
+                .to_string(),
+        ));
+    }
+
     // Build body
     let mut body = json!({
         "summary": summary,
-        "start": { "dateTime": start },
-        "end": { "dateTime": end },
+        "start": event_time(start, time_zone),
+        "end": event_time(end, time_zone),
     });
 
     if let Some(loc) = location {
@@ -677,7 +735,7 @@ mod tests {
             "--end",
             "2024-01-01T11:00:00Z",
         ]);
-        let (params, body, scopes) = build_insert_request(&matches, &doc).unwrap();
+        let (params, body, scopes) = build_insert_request(&matches, &doc, None).unwrap();
 
         assert!(params.contains("primary"));
         assert!(body.contains("Meeting"));
@@ -698,7 +756,7 @@ mod tests {
             "2024-01-01T11:00:00Z",
             "--meet",
         ]);
-        let (params, body, _) = build_insert_request(&matches, &doc).unwrap();
+        let (params, body, _) = build_insert_request(&matches, &doc, None).unwrap();
 
         let params_json: serde_json::Value = serde_json::from_str(&params).unwrap();
         assert_eq!(params_json["conferenceDataVersion"], 1);
@@ -723,10 +781,10 @@ mod tests {
             "--meet",
         ];
         let matches1 = make_matches_insert(args);
-        let (_, body1, _) = build_insert_request(&matches1, &doc).unwrap();
+        let (_, body1, _) = build_insert_request(&matches1, &doc, None).unwrap();
 
         let matches2 = make_matches_insert(args);
-        let (_, body2, _) = build_insert_request(&matches2, &doc).unwrap();
+        let (_, body2, _) = build_insert_request(&matches2, &doc, None).unwrap();
 
         let b1: serde_json::Value = serde_json::from_str(&body1).unwrap();
         let b2: serde_json::Value = serde_json::from_str(&body2).unwrap();
@@ -758,7 +816,7 @@ mod tests {
             "c@d.com",
         ];
         let (_, body_base, _) =
-            build_insert_request(&make_matches_insert(args_base), &doc).unwrap();
+            build_insert_request(&make_matches_insert(args_base), &doc, None).unwrap();
         let b_base: serde_json::Value = serde_json::from_str(&body_base).unwrap();
         let id_base = b_base["conferenceData"]["createRequest"]["requestId"]
             .as_str()
@@ -780,7 +838,7 @@ mod tests {
             "a@b.com",
         ];
         let (_, body_reordered, _) =
-            build_insert_request(&make_matches_insert(args_reordered), &doc).unwrap();
+            build_insert_request(&make_matches_insert(args_reordered), &doc, None).unwrap();
         let b_reordered: serde_json::Value = serde_json::from_str(&body_reordered).unwrap();
         let id_reordered = b_reordered["conferenceData"]["createRequest"]["requestId"]
             .as_str()
@@ -807,7 +865,7 @@ mod tests {
             "c@d.com",
         ];
         let (_, body_diff, _) =
-            build_insert_request(&make_matches_insert(args_diff), &doc).unwrap();
+            build_insert_request(&make_matches_insert(args_diff), &doc, None).unwrap();
         let b_diff: serde_json::Value = serde_json::from_str(&body_diff).unwrap();
         let id_diff = b_diff["conferenceData"]["createRequest"]["requestId"]
             .as_str()
@@ -839,7 +897,7 @@ mod tests {
             "--attendee",
             "c@d.com",
         ]);
-        let (_, body, _) = build_insert_request(&matches, &doc).unwrap();
+        let (_, body, _) = build_insert_request(&matches, &doc, None).unwrap();
 
         assert!(body.contains("Room 1"));
         assert!(body.contains("Discuss stuff"));
@@ -883,6 +941,73 @@ mod tests {
                 "2026-10-20T08:00:00-06:00",
             ]
         );
+    }
+
+    fn insert_body(start: &str, end: &str, tz: Option<&str>) -> Result<Value, GwsError> {
+        let matches = make_matches_insert(&[
+            "test",
+            "--summary",
+            "Standup",
+            "--start",
+            start,
+            "--end",
+            end,
+        ]);
+        let (_, body, _) = build_insert_request(&matches, &make_mock_doc(), tz)?;
+        Ok(serde_json::from_str(&body).unwrap())
+    }
+
+    #[test]
+    fn insert_date_only_is_all_day() {
+        let body = insert_body("2026-10-20", "2026-10-21", None).unwrap();
+        assert_eq!(body["start"], json!({ "date": "2026-10-20" }));
+        assert_eq!(body["end"], json!({ "date": "2026-10-21" }));
+    }
+
+    #[test]
+    fn insert_time_without_offset_carries_time_zone() {
+        let body = insert_body(
+            "2026-10-20T10:00:00",
+            "2026-10-20T10:30",
+            Some("America/Denver"),
+        )
+        .unwrap();
+        assert_eq!(
+            body["start"],
+            json!({ "dateTime": "2026-10-20T10:00:00", "timeZone": "America/Denver" })
+        );
+        assert_eq!(
+            body["end"],
+            json!({ "dateTime": "2026-10-20T10:30", "timeZone": "America/Denver" })
+        );
+    }
+
+    #[test]
+    fn insert_time_with_offset_is_sent_as_is() {
+        let body = insert_body(
+            "2026-10-20T10:00:00-06:00",
+            "2026-10-20T16:30:00Z",
+            Some("America/Denver"),
+        )
+        .unwrap();
+        assert_eq!(
+            body["start"],
+            json!({ "dateTime": "2026-10-20T10:00:00-06:00" })
+        );
+        assert_eq!(body["end"], json!({ "dateTime": "2026-10-20T16:30:00Z" }));
+    }
+
+    #[test]
+    fn insert_rejects_mixing_dates_and_times() {
+        assert!(insert_body("2026-10-20", "2026-10-20T11:00:00Z", None).is_err());
+    }
+
+    #[test]
+    fn insert_needs_time_zone_only_for_times_without_offset() {
+        assert!(needs_time_zone("2026-10-20T10:00:00"));
+        assert!(!needs_time_zone("2026-10-20T10:00:00Z"));
+        assert!(!needs_time_zone("2026-10-20T10:00:00+02:00"));
+        assert!(!needs_time_zone("2026-10-20"));
     }
 
     /// Serve one canned HTTP response per connection on a local port.

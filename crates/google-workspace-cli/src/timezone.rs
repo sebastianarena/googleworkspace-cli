@@ -163,11 +163,14 @@ pub async fn resolve_account_timezone(
         return Ok(tz);
     }
 
-    // 3. Fetch from Calendar Settings API
-    match fetch_account_timezone(client, token).await {
-        Ok(tz) => return Ok(tz),
-        Err(e) => {
-            tracing::warn!(error = %e, "failed to fetch account timezone, falling back to local");
+    // 3. Fetch from Calendar Settings API (not possible without a token,
+    //    e.g. an unauthenticated --dry-run)
+    if !token.is_empty() {
+        match fetch_account_timezone(client, token).await {
+            Ok(tz) => return Ok(tz),
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to fetch account timezone, falling back to local");
+            }
         }
     }
 

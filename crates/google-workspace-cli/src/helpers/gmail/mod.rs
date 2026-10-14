@@ -120,13 +120,13 @@ impl Mailbox {
         }
     }
 
-    /// Parse a comma-separated address list, respecting quoted strings.
-    /// Empty-email entries (e.g. from trailing commas) are filtered out.
+    /// Parse a comma-separated address list (see `split_raw_mailbox_list`).
+    /// Entries without an `@` (e.g. from trailing commas) are filtered out.
     pub fn parse_list(raw: &str) -> Vec<Self> {
         split_raw_mailbox_list(raw)
             .into_iter()
             .map(Mailbox::parse)
-            .filter(|m| !m.email.is_empty())
+            .filter(|m| m.email.contains('@'))
             .collect()
     }
 
@@ -1253,11 +1253,19 @@ pub(super) fn html_escape(text: &str) -> String {
         .replace('\'', "&#39;")
 }
 
-/// Split an RFC 5322 mailbox list on commas, respecting quoted strings.
-/// Returns raw string slices — use `Mailbox::parse_list` for structured parsing.
+/// Split an RFC 5322 address list into raw mailbox strings.
+///
+/// Commas split only outside quoted strings and angle brackets. Group syntax
+/// (`Team: a@example.com, b@example.com;`) yields its members, and an empty
+/// group such as `undisclosed-recipients:;` yields nothing. An unquoted
+/// display name containing a comma (`Doe, Jane <jane@example.com>`) is kept
+/// whole. Use `Mailbox::parse_list` for structured parsing.
 fn split_raw_mailbox_list(header: &str) -> Vec<&str> {
     let mut result = Vec::new();
+    // Start of `@`-less fragments that may begin an unquoted display name.
+    let mut name_start = None;
     let mut in_quotes = false;
+    let mut in_angle = false;
     let mut start = 0;
     let mut prev_backslash = false;
 
@@ -1268,24 +1276,58 @@ fn split_raw_mailbox_list(header: &str) -> Vec<&str> {
                 continue;
             }
             '"' if !prev_backslash => in_quotes = !in_quotes,
-            ',' if !in_quotes => {
-                let token = header[start..i].trim();
-                if !token.is_empty() {
-                    result.push(token);
-                }
+            '<' if !in_quotes => in_angle = true,
+            '>' if !in_quotes => in_angle = false,
+            ',' if !in_quotes && !in_angle => {
+                push_mailbox_token(header, start, i, &mut name_start, &mut result);
+                start = i + 1;
+            }
+            // Group start: drop the group's display name (a phrase, so a
+            // colon after an address is not a group).
+            ':' if !in_quotes && !in_angle && !header[start..i].contains(['@', '>']) => {
+                name_start = None;
+                start = i + 1;
+            }
+            // Group end.
+            ';' if !in_quotes && !in_angle => {
+                push_mailbox_token(header, start, i, &mut name_start, &mut result);
+                name_start = None;
                 start = i + 1;
             }
             _ => {}
         }
         prev_backslash = false;
     }
-
-    let token = header[start..].trim();
-    if !token.is_empty() {
-        result.push(token);
-    }
+    push_mailbox_token(header, start, header.len(), &mut name_start, &mut result);
 
     result
+}
+
+/// Push `header[start..end]` as a mailbox if it holds an address. A bare
+/// fragment without `@` or brackets is remembered as the beginning of an
+/// unquoted display name and joined to a following `Name <addr>` token.
+fn push_mailbox_token<'a>(
+    header: &'a str,
+    start: usize,
+    end: usize,
+    name_start: &mut Option<usize>,
+    result: &mut Vec<&'a str>,
+) {
+    let token = header[start..end].trim();
+    if token.is_empty() {
+        return;
+    }
+    if token.contains('@') {
+        let from = match name_start.take() {
+            Some(name) if token.contains('<') => name,
+            _ => start,
+        };
+        result.push(header[from..end].trim());
+    } else if token.contains(['<', '>']) {
+        *name_start = None;
+    } else if name_start.is_none() {
+        *name_start = Some(start);
+    }
 }
 
 /// Wrap an email address in an HTML mailto link: `<a href="mailto:e">e</a>`.
@@ -3057,6 +3099,48 @@ mod tests {
         assert_eq!(list[0].email, "john@example.com");
         assert_eq!(list[0].name.as_deref(), Some("Doe, John"));
         assert_eq!(list[1].email, "alice@example.com");
+    }
+
+    #[test]
+    fn test_mailbox_parse_list_unquoted_name_with_comma() {
+        let list = Mailbox::parse_list("Müller, Hans <hans@example.com>, bob@example.com");
+        assert_eq!(list.len(), 2, "{list:?}");
+        assert_eq!(list[0].name.as_deref(), Some("Müller, Hans"));
+        assert_eq!(list[0].email, "hans@example.com");
+        assert_eq!(list[1].email, "bob@example.com");
+    }
+
+    #[test]
+    fn test_mailbox_parse_list_group_syntax() {
+        let list = Mailbox::parse_list(
+            "Team: alice@example.com, Bob <bob@example.com>;, carol@example.com",
+        );
+        let emails: Vec<_> = list.iter().map(|m| m.email.as_str()).collect();
+        assert_eq!(
+            emails,
+            ["alice@example.com", "bob@example.com", "carol@example.com"]
+        );
+        assert_eq!(list[1].name.as_deref(), Some("Bob"));
+
+        assert!(Mailbox::parse_list("undisclosed-recipients:;").is_empty());
+        let list = Mailbox::parse_list("undisclosed-recipients:; alice@example.com");
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].email, "alice@example.com");
+    }
+
+    #[test]
+    fn test_mailbox_parse_list_drops_entries_without_at() {
+        let list = Mailbox::parse_list("bob, alice@example.com, Carol <carol>, nobody");
+        let emails: Vec<_> = list.iter().map(|m| m.email.as_str()).collect();
+        assert_eq!(emails, ["alice@example.com"]);
+    }
+
+    #[test]
+    fn test_mailbox_parse_list_comma_inside_angle_brackets() {
+        let list = Mailbox::parse_list(r#"Alice <"a,b"@example.com>, bob@example.com"#);
+        assert_eq!(list.len(), 2, "{list:?}");
+        assert_eq!(list[0].email, r#""a,b"@example.com"#);
+        assert_eq!(list[1].email, "bob@example.com");
     }
 
     #[test]

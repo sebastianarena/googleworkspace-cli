@@ -1079,6 +1079,11 @@ fn validate_property(
     path: &str,
     errors: &mut Vec<String>,
 ) {
+    // null clears a field (e.g. in a PATCH), so it is valid for any type.
+    if value.is_null() {
+        return;
+    }
+
     // 1. Resolve $ref if present
     if let Some(ref_name) = &prop_schema.schema_ref {
         validate_value(value, ref_name, doc, path, errors);
@@ -1407,6 +1412,64 @@ mod tests {
         let body_not_object = json!([]);
         let err = validate_body_against_schema(&body_not_object, "File", &doc).unwrap_err();
         assert!(err.to_string().contains("Expected object"));
+    }
+
+    #[test]
+    fn test_validate_body_accepts_null_for_any_type() {
+        let mut properties = HashMap::new();
+        for (name, ty) in [
+            ("location", "string"),
+            ("count", "integer"),
+            ("flag", "boolean"),
+            ("tags", "array"),
+            ("extra", "object"),
+        ] {
+            properties.insert(
+                name.to_string(),
+                JsonSchemaProperty {
+                    prop_type: Some(ty.to_string()),
+                    ..Default::default()
+                },
+            );
+        }
+        properties.insert(
+            "parent".to_string(),
+            JsonSchemaProperty {
+                schema_ref: Some("Parent".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let mut schemas = HashMap::new();
+        schemas.insert(
+            "Event".to_string(),
+            JsonSchema {
+                schema_type: Some("object".to_string()),
+                properties,
+                ..Default::default()
+            },
+        );
+        schemas.insert(
+            "Parent".to_string(),
+            JsonSchema {
+                schema_type: Some("object".to_string()),
+                ..Default::default()
+            },
+        );
+        let doc = RestDescription {
+            schemas,
+            ..Default::default()
+        };
+
+        let body = json!({
+            "location": null,
+            "count": null,
+            "flag": null,
+            "tags": null,
+            "extra": null,
+            "parent": null
+        });
+        assert!(validate_body_against_schema(&body, "Event", &doc).is_ok());
     }
     #[tokio::test]
     async fn test_build_multipart_body() {

@@ -213,7 +213,7 @@ export GOOGLE_WORKSPACE_CLI_TOKEN=$(gcloud auth print-access-token)
 | 3        | Encrypted credentials  | `gws auth login`                        |
 | 4        | Plaintext credentials  | `~/.config/gws/credentials.json`        |
 
-Environment variables can also live in a `.env` file.
+Environment variables can also live in a `.env` file when `GOOGLE_WORKSPACE_CLI_LOAD_DOTENV=1` is set.
 
 ## AI Agent Skills
 
@@ -387,8 +387,9 @@ All variables are optional. See [`.env.example`](.env.example) for a copy-paste 
 | `GOOGLE_WORKSPACE_CLI_LOG` | Log level for stderr (e.g., `gws=debug`). Off by default. |
 | `GOOGLE_WORKSPACE_CLI_LOG_FILE` | Directory for JSON log files with daily rotation. Off by default. |
 | `GOOGLE_WORKSPACE_PROJECT_ID` | GCP project ID override for quota/billing and fallback for helper commands |
+| `GOOGLE_WORKSPACE_CLI_LOAD_DOTENV` | Set to `1` to load a `.env` file. Off by default. |
 
-Environment variables can also be set in a `.env` file (loaded via [dotenvy](https://crates.io/crates/dotenvy)).
+Environment variables can also be set in a `.env` file (loaded via [dotenvy](https://crates.io/crates/dotenvy) from the current directory or a parent). This is opt-in: set `GOOGLE_WORKSPACE_CLI_LOAD_DOTENV=1`, since a `.env` otherwise applies to every account and config dir used from that directory.
 
 ## Exit Codes
 

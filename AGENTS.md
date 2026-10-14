@@ -236,4 +236,4 @@ See [`src/helpers/README.md`](crates/google-workspace-cli/src/helpers/README.md)
 | `GOOGLE_WORKSPACE_CLI_LOG` | Log level filter for stderr output (e.g., `gws=debug`). Off by default. |
 | `GOOGLE_WORKSPACE_CLI_LOG_FILE` | Directory for JSON-line log files with daily rotation. Off by default. |
 
-All variables can also live in a `.env` file (loaded via `dotenvy`).
+All variables can also live in a `.env` file (loaded via `dotenvy`) when `GOOGLE_WORKSPACE_CLI_LOAD_DOTENV=1` is set.

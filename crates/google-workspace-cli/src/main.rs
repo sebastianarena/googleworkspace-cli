@@ -47,8 +47,11 @@ use error::{print_error_json, GwsError};
 
 #[tokio::main]
 async fn main() {
-    // Load .env file if present (silently ignored if missing)
-    let _ = dotenvy::dotenv();
+    // A .env in the working directory (or a parent) is only loaded on request:
+    // it would otherwise apply to every account and config dir run from there.
+    if dotenv_enabled(std::env::var_os("GOOGLE_WORKSPACE_CLI_LOAD_DOTENV").as_deref()) {
+        let _ = dotenvy::dotenv();
+    }
 
     // Initialize structured logging (no-op if env vars are unset)
     logging::init_logging();
@@ -67,6 +70,13 @@ async fn main() {
 /// `gws sheets spreadsheets --help` incorrectly starts at `gws spreadsheets`.
 fn service_cli(doc: &discovery::RestDescription, service_arg: &str) -> clap::Command {
     commands::build_cli(doc).bin_name(format!("gws {service_arg}"))
+}
+
+/// Whether `GOOGLE_WORKSPACE_CLI_LOAD_DOTENV` opts in to loading `.env`.
+fn dotenv_enabled(value: Option<&std::ffi::OsStr>) -> bool {
+    value
+        .and_then(|v| v.to_str())
+        .is_some_and(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
 }
 
 async fn run() -> Result<(), GwsError> {
@@ -529,6 +539,9 @@ fn print_usage() {
     println!(
         "    GOOGLE_WORKSPACE_CLI_LOG_FILE            Directory for JSON log files (daily rotation)"
     );
+    println!(
+        "    GOOGLE_WORKSPACE_CLI_LOAD_DOTENV         Set to 1 to load a .env file from the current or a parent dir"
+    );
     println!();
     println!("EXIT CODES:");
     for (code, description) in crate::error::EXIT_CODE_DOCUMENTATION {
@@ -555,6 +568,18 @@ fn is_version_flag(arg: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_dotenv_is_opt_in() {
+        use std::ffi::OsStr;
+        assert!(!dotenv_enabled(None));
+        for off in ["", "0", "false", "no"] {
+            assert!(!dotenv_enabled(Some(OsStr::new(off))), "{off}");
+        }
+        for on in ["1", "true", "TRUE", "yes"] {
+            assert!(dotenv_enabled(Some(OsStr::new(on))), "{on}");
+        }
+    }
 
     #[test]
     fn test_service_cli_help_usage_includes_service_name() {

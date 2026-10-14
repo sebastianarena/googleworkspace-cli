@@ -120,7 +120,7 @@ TIPS:
                     &executor::PaginationConfig::default(),
                     None,
                     &crate::helpers::modelarmor::SanitizeMode::Warn,
-                    &crate::formatter::OutputFormat::default(),
+                    &super::output_format(matches),
                     false,
                 )
                 .await?;

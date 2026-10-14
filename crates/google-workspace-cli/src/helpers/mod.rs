@@ -111,6 +111,15 @@ pub trait Helper: Send + Sync {
     }
 }
 
+/// The global `--format` as seen from a helper's subcommand matches (JSON when unset).
+/// Unknown values were already warned about in `main`.
+pub(crate) fn output_format(matches: &ArgMatches) -> crate::formatter::OutputFormat {
+    matches
+        .get_one::<String>("format")
+        .map(|s| crate::formatter::OutputFormat::from_str(s))
+        .unwrap_or_default()
+}
+
 pub fn get_helper(service: &str) -> Option<Box<dyn Helper>> {
     match service {
         "gmail" => Some(Box::new(gmail::GmailHelper)),
@@ -124,5 +133,32 @@ pub fn get_helper(service: &str) -> Option<Box<dyn Helper>> {
         "modelarmor" => Some(Box::new(modelarmor::ModelArmorHelper)),
         "workflow" => Some(Box::new(workflows::WorkflowHelper)),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::formatter::OutputFormat;
+    use clap::Arg;
+
+    #[test]
+    fn test_output_format_reads_global_flag_from_subcommand() {
+        let cmd = Command::new("gws")
+            .arg(Arg::new("format").long("format").global(true))
+            .subcommand(Command::new("+read"));
+
+        for args in [
+            vec!["gws", "+read", "--format", "csv"],
+            vec!["gws", "--format", "csv", "+read"],
+        ] {
+            let m = cmd.clone().try_get_matches_from(args).unwrap();
+            let sub = m.subcommand_matches("+read").unwrap();
+            assert_eq!(output_format(sub), OutputFormat::Csv);
+        }
+
+        let m = cmd.try_get_matches_from(["gws", "+read"]).unwrap();
+        let sub = m.subcommand_matches("+read").unwrap();
+        assert_eq!(output_format(sub), OutputFormat::Json);
     }
 }

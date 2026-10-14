@@ -56,7 +56,8 @@ EXAMPLES:
 
 TIPS:
   Supports .gs, .js, .html, and appsscript.json files.
-  Skips hidden files and node_modules automatically.
+  Files in subfolders keep their relative path as the name (lib/Code.gs -> lib/Code).
+  Skips hidden files and folders, node_modules and symlinks automatically.
   This replaces ALL files in the project.",
                 ),
         );
@@ -139,39 +140,82 @@ TIPS:
     }
 }
 
-fn visit_dirs(dir: &Path, files: &mut Vec<serde_json::Value>) -> Result<(), GwsError> {
-    if dir.is_dir() {
-        for entry in fs::read_dir(dir).context("Failed to read dir")? {
-            let entry = entry.context("Failed to read entry")?;
-            let path = entry.path();
-            if path.is_dir() {
-                visit_dirs(&path, files)?;
-            } else if let Some(file_obj) = process_file(&path)? {
-                files.push(file_obj);
-            }
+/// Collects the pushable files under `root`. Each file is named by its path
+/// relative to `root` (e.g. `lib/Code` for `lib/Code.gs`), as Apps Script
+/// expects. Hidden paths, `node_modules` and symlinks are skipped.
+fn visit_dirs(root: &Path, files: &mut Vec<serde_json::Value>) -> Result<(), GwsError> {
+    visit_dir(root, root, files)?;
+
+    let mut seen = std::collections::HashSet::new();
+    for file in files.iter() {
+        let name = file["name"].as_str().unwrap_or_default();
+        if !seen.insert(name) {
+            return Err(GwsError::Validation(format!(
+                "Two files map to the Apps Script name '{name}'; rename one of them"
+            )));
         }
     }
     Ok(())
 }
 
-fn process_file(path: &Path) -> Result<Option<serde_json::Value>, GwsError> {
-    let filename = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
-    let extension = path.extension().and_then(|s| s.to_str()).unwrap_or("");
+fn visit_dir(root: &Path, dir: &Path, files: &mut Vec<serde_json::Value>) -> Result<(), GwsError> {
+    let mut entries = fs::read_dir(dir)
+        .context("Failed to read dir")?
+        .collect::<Result<Vec<_>, _>>()
+        .context("Failed to read entry")?;
+    entries.sort_by_key(|e| e.file_name());
 
-    // Skip hidden files, node_modules, .git, etc. (basic filtering)
-    if filename.starts_with('.') || path.components().any(|c| c.as_os_str() == "node_modules") {
+    for entry in entries {
+        let path = entry.path();
+        // file_type() does not follow symlinks.
+        let file_type = entry.file_type().context("Failed to read file type")?;
+        if file_type.is_symlink() {
+            continue;
+        }
+        if file_type.is_dir() {
+            let name = entry.file_name();
+            if name.to_string_lossy().starts_with('.') || name == "node_modules" {
+                continue;
+            }
+            visit_dir(root, &path, files)?;
+        } else if let Some(file_obj) = process_file(root, &path)? {
+            files.push(file_obj);
+        }
+    }
+    Ok(())
+}
+
+fn process_file(root: &Path, path: &Path) -> Result<Option<serde_json::Value>, GwsError> {
+    let rel = path.strip_prefix(root).unwrap_or(path);
+    let mut parts = Vec::new();
+    for component in rel.components() {
+        match component.as_os_str().to_str() {
+            Some(part) => parts.push(part),
+            None => return Ok(None),
+        }
+    }
+
+    // Skip hidden files and directories, node_modules, .git, etc.
+    if parts
+        .iter()
+        .any(|p| p.starts_with('.') || *p == "node_modules")
+    {
         return Ok(None);
     }
 
+    let extension = path.extension().and_then(|s| s.to_str()).unwrap_or("");
+    let stem_path = |ext: &str| {
+        let mut name = parts.join("/");
+        name.truncate(name.len() - ext.len() - 1);
+        name
+    };
+
     let (type_val, name_val) = match extension {
-        "gs" | "js" => (
-            "SERVER_JS",
-            filename.trim_end_matches(".js").trim_end_matches(".gs"),
-        ),
-        "html" => ("HTML", filename.trim_end_matches(".html")),
+        "gs" | "js" => ("SERVER_JS", stem_path(extension)),
+        "html" => ("HTML", stem_path(extension)),
         "json" => {
-            if filename == "appsscript.json" {
-                ("JSON", "appsscript")
+            if parts == ["appsscript.json"] {
+                ("JSON", "appsscript".to_string())
             } else {
                 return Ok(None);
             }
@@ -204,7 +248,7 @@ mod tests {
         let mut file = File::create(&file_path).unwrap();
         writeln!(file, "function foo() {{}}").unwrap();
 
-        let result = process_file(&file_path).unwrap().unwrap();
+        let result = process_file(dir.path(), &file_path).unwrap().unwrap();
         assert_eq!(result["name"], "code");
         assert_eq!(result["type"], "SERVER_JS");
         assert_eq!(
@@ -220,7 +264,7 @@ mod tests {
         let mut file = File::create(&file_path).unwrap();
         writeln!(file, "<html></html>").unwrap();
 
-        let result = process_file(&file_path).unwrap().unwrap();
+        let result = process_file(dir.path(), &file_path).unwrap().unwrap();
         assert_eq!(result["name"], "index");
         assert_eq!(result["type"], "HTML");
     }
@@ -232,7 +276,7 @@ mod tests {
         let mut file = File::create(&file_path).unwrap();
         writeln!(file, "{{}}").unwrap();
 
-        let result = process_file(&file_path).unwrap().unwrap();
+        let result = process_file(dir.path(), &file_path).unwrap().unwrap();
         assert_eq!(result["name"], "appsscript");
         assert_eq!(result["type"], "JSON");
     }
@@ -244,19 +288,19 @@ mod tests {
         // Random JSON
         let p1 = dir.path().join("other.json");
         File::create(&p1).unwrap();
-        assert!(process_file(&p1).unwrap().is_none());
+        assert!(process_file(dir.path(), &p1).unwrap().is_none());
 
         // Hidden file
         let p2 = dir.path().join(".hidden.gs");
         File::create(&p2).unwrap();
-        assert!(process_file(&p2).unwrap().is_none());
+        assert!(process_file(dir.path(), &p2).unwrap().is_none());
 
         // node_modules
         let node_modules = dir.path().join("node_modules");
         fs::create_dir(&node_modules).unwrap();
         let p3 = node_modules.join("dep.gs");
         File::create(&p3).unwrap();
-        assert!(process_file(&p3).unwrap().is_none());
+        assert!(process_file(dir.path(), &p3).unwrap().is_none());
     }
 
     #[test]
@@ -285,6 +329,45 @@ mod tests {
         let names: Vec<&str> = files.iter().map(|f| f["name"].as_str().unwrap()).collect();
 
         assert!(names.contains(&"root"));
-        assert!(names.contains(&"utils"));
+        assert!(names.contains(&"src/utils"));
+    }
+
+    #[test]
+    fn test_visit_dirs_names_skips_hidden_and_symlinks() {
+        let dir = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        for sub in ["a", "b", ".hidden", "a/.cache"] {
+            fs::create_dir_all(dir.path().join(sub)).unwrap();
+        }
+        File::create(dir.path().join("a/Code.gs")).unwrap();
+        File::create(dir.path().join("b/Code.gs")).unwrap();
+        File::create(dir.path().join(".hidden/secret.js")).unwrap();
+        File::create(dir.path().join("a/.cache/x.gs")).unwrap();
+        File::create(outside.path().join("linked.gs")).unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(outside.path(), dir.path().join("linkdir")).unwrap();
+            std::os::unix::fs::symlink(
+                outside.path().join("linked.gs"),
+                dir.path().join("linkfile.gs"),
+            )
+            .unwrap();
+        }
+
+        let mut files = Vec::new();
+        visit_dirs(dir.path(), &mut files).unwrap();
+        let mut names: Vec<&str> = files.iter().map(|f| f["name"].as_str().unwrap()).collect();
+        names.sort();
+        assert_eq!(names, vec!["a/Code", "b/Code"]);
+    }
+
+    #[test]
+    fn test_visit_dirs_rejects_duplicate_names() {
+        let dir = tempdir().unwrap();
+        File::create(dir.path().join("Code.gs")).unwrap();
+        File::create(dir.path().join("Code.js")).unwrap();
+        let mut files = Vec::new();
+        let err = visit_dirs(dir.path(), &mut files).unwrap_err();
+        assert!(err.to_string().contains("Code"), "{err}");
     }
 }

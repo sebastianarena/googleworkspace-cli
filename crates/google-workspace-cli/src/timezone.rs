@@ -182,18 +182,24 @@ pub async fn resolve_account_timezone(
     Ok(tz)
 }
 
-/// Return the start of today (midnight) in the given timezone as a
-/// timezone-aware `DateTime`. Errors if midnight cannot be resolved
-/// (e.g. a DST transition that skips midnight — extremely rare).
+/// Return the start of today in the given timezone. See [`start_of_day`].
 pub fn start_of_today(tz: Tz) -> Result<chrono::DateTime<Tz>, crate::error::GwsError> {
-    use chrono::{NaiveTime, TimeZone, Utc};
+    start_of_day(tz, chrono::Utc::now().with_timezone(&tz).date_naive())
+}
 
-    let now_in_tz = Utc::now().with_timezone(&tz);
-    let today_start = now_in_tz
-        .date_naive()
-        .and_time(NaiveTime::from_hms_opt(0, 0, 0).unwrap());
-    tz.from_local_datetime(&today_start)
-        .earliest()
+/// Return the first instant of `date` in `tz`. That is local midnight,
+/// except where a DST change skips midnight (e.g. America/Santiago), in
+/// which case it is the first local time that exists on that day.
+pub fn start_of_day(
+    tz: Tz,
+    date: chrono::NaiveDate,
+) -> Result<chrono::DateTime<Tz>, crate::error::GwsError> {
+    use chrono::{Duration, NaiveTime, TimeZone};
+
+    let midnight = date.and_time(NaiveTime::MIN);
+    (0..24 * 60)
+        .map(|m| midnight + Duration::minutes(m))
+        .find_map(|local| tz.from_local_datetime(&local).earliest())
         .ok_or_else(|| {
             crate::error::GwsError::Other(anyhow::anyhow!(
                 "Could not determine start of day in timezone '{}'",
@@ -252,6 +258,21 @@ mod tests {
         let contents = std::fs::read_to_string(&cache_file).unwrap();
         let tz: Tz = contents.trim().parse().unwrap();
         assert_eq!(tz, chrono_tz::America::New_York);
+    }
+
+    #[test]
+    fn start_of_day_is_local_midnight() {
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 11, 1).unwrap();
+        let start = start_of_day(chrono_tz::America::Denver, date).unwrap();
+        assert_eq!(start.to_rfc3339(), "2026-11-01T00:00:00-06:00");
+    }
+
+    #[test]
+    fn start_of_day_when_dst_skips_midnight() {
+        // Chile springs forward at 00:00 -> 01:00, so midnight never happens.
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 9, 6).unwrap();
+        let start = start_of_day(chrono_tz::America::Santiago, date).unwrap();
+        assert_eq!(start.to_rfc3339(), "2026-09-06T01:00:00-03:00");
     }
 
     #[test]

@@ -176,8 +176,9 @@ impl OriginalPart {
 /// A parsed Gmail message fetched via the API, used as context for reply/forward.
 ///
 /// `from` is always populated — `parse_original_message` returns an error when
-/// `From` is missing. `body_text` always has a value — it falls back to the
-/// message snippet when no `text/plain` MIME part is found. Semantically optional
+/// `From` is missing. `body_text` always has a value — when no `text/plain` MIME
+/// part is found it is rendered from the HTML part, and only falls back to the
+/// message snippet when there is no text body at all. Semantically optional
 /// fields (`cc`, `reply_to`, `date`, `body_html`) use `Option` so the compiler
 /// enforces absence checks.
 #[derive(Default, Serialize)]
@@ -336,7 +337,11 @@ fn parse_original_message(msg: &Value) -> Result<OriginalMessage, GwsError> {
         .map(extract_payload_contents)
         .unwrap_or_default();
 
-    let body_text = extracted_text.unwrap_or(snippet);
+    // The snippet is a ~200-character preview, so it is the last resort: an
+    // HTML-only message gets its plain text rendered from the HTML part.
+    let body_text = extracted_text
+        .or_else(|| body_html.as_deref().and_then(html_to_plain_text))
+        .unwrap_or(snippet);
 
     // Parse references: split on whitespace and strip any angle brackets, producing bare IDs
     let references = parsed_headers
@@ -1029,6 +1034,29 @@ pub(super) fn resolve_html_body(original: &OriginalMessage) -> String {
             .lines()
             .collect::<Vec<_>>()
             .join("<br>\r\n"),
+    }
+}
+
+/// Render an HTML body as plain text: links become numbered footnotes and
+/// tables are flattened, since mail HTML uses them for layout.
+/// Returns `None` when rendering fails or yields no text.
+fn html_to_plain_text(html: &str) -> Option<String> {
+    let text = html2text::config::plain_no_decorate()
+        .link_footnotes(true)
+        .raw_mode(true)
+        .allow_width_overflow()
+        .string_from_read(html.as_bytes(), 80)
+        .ok()?;
+    let text = text
+        .lines()
+        .map(str::trim_end)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let text = text.trim();
+    if text.is_empty() {
+        None
+    } else {
+        Some(text.to_string())
     }
 }
 
@@ -2255,8 +2283,14 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_original_message_snippet_fallback() {
-        // When only text/html is present (no text/plain), body_text falls back to snippet
+    fn test_parse_original_message_html_only_derives_text() {
+        // When only text/html is present, body_text is rendered from the HTML,
+        // not the truncated snippet.
+        let long_paragraph = "word ".repeat(80);
+        let html = format!(
+            "<html><body><p>Hello <b>Bob</b>,</p><p>{long_paragraph}</p>\
+             <p>See <a href=\"https://example.com/doc\">the doc</a>.</p></body></html>"
+        );
         let msg = json!({
             "threadId": "t1",
             "snippet": "Snippet fallback text",
@@ -2266,12 +2300,45 @@ mod tests {
                     { "name": "From", "value": "alice@example.com" },
                     { "name": "Message-ID", "value": "<msg@example.com>" }
                 ],
-                "body": { "data": URL_SAFE.encode("<p>HTML only</p>") }
+                "body": { "data": URL_SAFE.encode(&html) }
+            }
+        });
+        let original = parse_original_message(&msg).unwrap();
+        assert!(!original.body_text.contains("Snippet"));
+        assert!(original.body_text.contains("Hello Bob,"));
+        assert!(original.body_text.contains("the doc"));
+        assert!(!original.body_text.contains("<p>"));
+        assert_eq!(
+            original.body_text.matches("word").count(),
+            80,
+            "the whole body must survive: {}",
+            original.body_text
+        );
+        assert_eq!(original.body_html.unwrap(), html);
+    }
+
+    #[test]
+    fn test_parse_original_message_snippet_fallback_without_body() {
+        // The snippet is used only when the message has no text body at all.
+        let msg = json!({
+            "threadId": "t1",
+            "snippet": "Snippet fallback text",
+            "payload": {
+                "mimeType": "multipart/mixed",
+                "headers": [
+                    { "name": "From", "value": "alice@example.com" },
+                    { "name": "Message-ID", "value": "<msg@example.com>" }
+                ],
+                "parts": [{
+                    "mimeType": "application/pdf",
+                    "filename": "report.pdf",
+                    "body": { "attachmentId": "ATT1", "size": 10 }
+                }]
             }
         });
         let original = parse_original_message(&msg).unwrap();
         assert_eq!(original.body_text, "Snippet fallback text");
-        assert_eq!(original.body_html.unwrap(), "<p>HTML only</p>");
+        assert!(original.body_html.is_none());
     }
 
     // --- extract_plain_text_body tests ---
@@ -2496,7 +2563,7 @@ mod tests {
             original.references,
             vec!["ref-1@example.com", "ref-2@example.com"]
         );
-        assert_eq!(original.body_text, "Snippet fallback");
+        assert_eq!(original.body_text.trim(), "HTML only");
         assert_eq!(original.body_html.as_deref(), Some("<p>HTML only</p>"));
     }
 

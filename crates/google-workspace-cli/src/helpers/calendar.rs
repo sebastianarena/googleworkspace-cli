@@ -251,20 +251,18 @@ async fn handle_agenda(matches: &ArgMatches) -> Result<(), GwsError> {
     let calendar_filter = matches.get_one::<String>("calendar");
 
     // 1. List all calendars
-    let list_json = get_calendar_json(
-        &client,
-        &format!("{CALENDAR_API}/users/me/calendarList"),
-        &token,
-        &[],
-        "calendarList_failed",
-    )
+    let list_url = format!("{CALENDAR_API}/users/me/calendarList");
+    let calendars = fetch_all_pages(|page_token| {
+        let (client, list_url, token) = (&client, &list_url, &token);
+        async move {
+            let query: Vec<(&str, &str)> = page_token
+                .as_deref()
+                .map(|t| vec![("pageToken", t)])
+                .unwrap_or_default();
+            get_calendar_json(client, list_url, token, &query, "calendarList_failed").await
+        }
+    })
     .await?;
-
-    let calendars = list_json
-        .get("items")
-        .and_then(|i| i.as_array())
-        .cloned()
-        .unwrap_or_default();
 
     // 2. For each calendar, fetch events concurrently
     use futures_util::stream::{self, StreamExt};
@@ -308,21 +306,24 @@ async fn handle_agenda(matches: &ArgMatches) -> Result<(), GwsError> {
                     "{CALENDAR_API}/calendars/{}/events",
                     crate::validate::encode_path_segment(&cal.id),
                 );
-                let query = events_list_query(time_min, time_max, tz);
-                let events =
-                    get_calendar_json(client, &events_url, token, &query, "events_list_failed")
-                        .await
-                        .map(|json| {
-                            json.get("items")
-                                .and_then(|i| i.as_array())
-                                .map(|items| {
-                                    items
-                                        .iter()
-                                        .map(|event| agenda_entry(event, &cal.summary))
-                                        .collect()
-                                })
-                                .unwrap_or_default()
-                        });
+                let events = fetch_all_pages(|page_token| {
+                    let events_url = &events_url;
+                    async move {
+                        let mut query = events_list_query(time_min, time_max, tz);
+                        if let Some(t) = page_token.as_deref() {
+                            query.push(("pageToken", t));
+                        }
+                        get_calendar_json(client, events_url, token, &query, "events_list_failed")
+                            .await
+                    }
+                })
+                .await
+                .map(|items| {
+                    items
+                        .iter()
+                        .map(|event| agenda_entry(event, &cal.summary))
+                        .collect()
+                });
                 (cal.summary, events)
             }
         })
@@ -388,6 +389,27 @@ async fn get_calendar_json(
     resp.json()
         .await
         .map_err(|e| GwsError::Other(anyhow::anyhow!("Failed to parse response: {e}")))
+}
+
+/// Collect `items` from a paged list endpoint. `fetch_page` gets the page
+/// token to request (`None` for the first page).
+async fn fetch_all_pages<F, Fut>(mut fetch_page: F) -> Result<Vec<Value>, GwsError>
+where
+    F: FnMut(Option<String>) -> Fut,
+    Fut: Future<Output = Result<Value, GwsError>>,
+{
+    let mut items = Vec::new();
+    let mut page_token = None;
+    loop {
+        let page = fetch_page(page_token.take()).await?;
+        if let Some(page_items) = page.get("items").and_then(|i| i.as_array()) {
+            items.extend(page_items.iter().cloned());
+        }
+        match page.get("nextPageToken").and_then(|t| t.as_str()) {
+            Some(token) if !token.is_empty() => page_token = Some(token.to_string()),
+            _ => return Ok(items),
+        }
+    }
 }
 
 fn agenda_entry(event: &Value, calendar: &str) -> Value {
@@ -474,7 +496,7 @@ fn events_list_query<'a>(
         ("timeMax", time_max),
         ("singleEvents", "true"),
         ("orderBy", "startTime"),
-        ("maxResults", "50"),
+        ("maxResults", "250"),
         // Return event times in the account zone rather than each calendar's.
         ("timeZone", tz.name()),
     ]
@@ -902,6 +924,45 @@ mod tests {
 
         let err = get_calendar_json(&client, &base, "t", &[], "events_list_failed").await;
         assert!(err.is_err());
+    }
+
+    #[tokio::test]
+    async fn fetch_all_pages_follows_next_page_token() {
+        let pages = [
+            json!({ "items": [{ "id": "a" }, { "id": "b" }], "nextPageToken": "p2" }),
+            json!({ "items": [{ "id": "c" }], "nextPageToken": "p3" }),
+            json!({ "items": [{ "id": "d" }] }),
+        ];
+        let mut requested = Vec::new();
+        let items = fetch_all_pages(|token| {
+            requested.push(token.clone());
+            let page = match token.as_deref() {
+                None => pages[0].clone(),
+                Some("p2") => pages[1].clone(),
+                _ => pages[2].clone(),
+            };
+            async move { Ok(page) }
+        })
+        .await
+        .unwrap();
+        let ids: Vec<&str> = items.iter().map(|i| i["id"].as_str().unwrap()).collect();
+        assert_eq!(ids, ["a", "b", "c", "d"]);
+        assert_eq!(
+            requested,
+            [None, Some("p2".to_string()), Some("p3".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_all_pages_fails_when_a_later_page_fails() {
+        let result = fetch_all_pages(|token| async move {
+            match token {
+                None => Ok(json!({ "items": [{ "id": "a" }], "nextPageToken": "p2" })),
+                Some(_) => Err(GwsError::Other(anyhow::anyhow!("boom"))),
+            }
+        })
+        .await;
+        assert!(result.is_err());
     }
 
     #[test]

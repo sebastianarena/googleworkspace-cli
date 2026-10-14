@@ -393,6 +393,27 @@ async fn create_download_file(
     )))
 }
 
+#[derive(Debug, PartialEq)]
+enum ResponseBody {
+    Empty,
+    Json,
+    Binary,
+}
+
+/// Decide how to handle a successful response body.
+fn classify_response(status: reqwest::StatusCode, content_type: &str) -> ResponseBody {
+    if status == reqwest::StatusCode::NO_CONTENT {
+        ResponseBody::Empty
+    } else if content_type.is_empty()
+        || content_type.contains("application/json")
+        || content_type.contains("text/json")
+    {
+        ResponseBody::Json
+    } else {
+        ResponseBody::Binary
+    }
+}
+
 /// Handle a binary response by streaming it to a file.
 async fn handle_binary_response(
     response: reqwest::Response,
@@ -543,10 +564,16 @@ pub async fn execute_method(
             "API request"
         );
 
-        let is_json =
-            content_type.contains("application/json") || content_type.contains("text/json");
+        let body_kind = classify_response(status, &content_type);
 
-        if is_json || content_type.is_empty() {
+        // 204 No Content: the server intentionally sent no body, so there is nothing
+        // to parse or save. Endpoints whose 204 response happens to carry a non-empty
+        // content-type header (e.g. "text/html") must not reach handle_binary_response().
+        if body_kind == ResponseBody::Empty {
+            break;
+        }
+
+        if body_kind == ResponseBody::Json {
             let body_text = response
                 .text()
                 .await
@@ -2647,4 +2674,26 @@ fn test_next_page_reports_limit_reached_when_token_remains() {
 
     let single = PaginationConfig::default();
     assert_eq!(next_page(&with_token, &single, 1), NextPage::Done);
+}
+
+#[test]
+fn test_classify_response_204_is_empty_whatever_the_content_type() {
+    use reqwest::StatusCode;
+    assert_eq!(
+        classify_response(StatusCode::NO_CONTENT, "text/html; charset=UTF-8"),
+        ResponseBody::Empty
+    );
+    assert_eq!(
+        classify_response(StatusCode::NO_CONTENT, ""),
+        ResponseBody::Empty
+    );
+    assert_eq!(
+        classify_response(StatusCode::OK, "application/json; charset=UTF-8"),
+        ResponseBody::Json
+    );
+    assert_eq!(classify_response(StatusCode::OK, ""), ResponseBody::Json);
+    assert_eq!(
+        classify_response(StatusCode::OK, "application/pdf"),
+        ResponseBody::Binary
+    );
 }

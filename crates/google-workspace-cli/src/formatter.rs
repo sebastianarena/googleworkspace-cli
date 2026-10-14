@@ -90,20 +90,87 @@ pub fn format_value_paginated(value: &Value, format: &OutputFormat, is_first_pag
 /// Extract a "data array" from a typical Google API list response.
 /// Google APIs return lists as `{ "files": [...], "nextPageToken": "..." }`
 /// where the array key varies by resource type.
+///
+/// `items` wins (even when empty), then a known list field, then the largest
+/// array of objects. Metadata arrays such as Calendar's `defaultReminders`
+/// are never picked.
 fn extract_items(value: &Value) -> Option<(&str, &Vec<Value>)> {
-    if let Value::Object(obj) = value {
-        for (key, val) in obj {
-            if key == "nextPageToken" || key == "kind" || key.starts_with('_') {
-                continue;
-            }
-            if let Value::Array(arr) = val {
-                if !arr.is_empty() {
-                    return Some((key, arr));
-                }
+    const LIST_FIELDS: &[&str] = &[
+        "files",
+        "messages",
+        "threads",
+        "labels",
+        "drafts",
+        "history",
+        "calendars",
+        "events",
+        "values",
+        "valueRanges",
+        "spaces",
+        "memberships",
+        "drives",
+        "permissions",
+        "comments",
+        "replies",
+        "revisions",
+        "changes",
+        "users",
+        "groups",
+        "members",
+        "connections",
+        "contactGroups",
+        "otherContacts",
+        "people",
+        "courses",
+        "courseWork",
+        "students",
+        "teachers",
+        "responses",
+        "forms",
+        "tasks",
+        "activities",
+        "conferenceRecords",
+        "participants",
+        "recordings",
+        "transcripts",
+    ];
+    const METADATA_FIELDS: &[&str] = &["defaultReminders", "warnings", "unreachable"];
+
+    let Value::Object(obj) = value else {
+        return None;
+    };
+
+    if let Some(Value::Array(arr)) = obj.get("items") {
+        return Some(("items", arr));
+    }
+    for field in LIST_FIELDS {
+        if let Some((key, Value::Array(arr))) = obj.get_key_value(*field) {
+            if !arr.is_empty() {
+                return Some((key.as_str(), arr));
             }
         }
     }
-    None
+
+    let candidates = || {
+        obj.iter().filter_map(|(key, val)| match val {
+            Value::Array(arr)
+                if !arr.is_empty()
+                    && key != "nextPageToken"
+                    && key != "kind"
+                    && !key.starts_with('_')
+                    && !METADATA_FIELDS.contains(&key.as_str()) =>
+            {
+                Some((key.as_str(), arr))
+            }
+            _ => None,
+        })
+    };
+    candidates()
+        .filter(|(_, arr)| arr.iter().any(Value::is_object))
+        // max_by_key keeps the last maximum; reverse so ties go to the first key.
+        .rev()
+        .max_by_key(|(_, arr)| arr.len())
+        .or_else(|| candidates().next())
 }
 
 fn format_table(value: &Value) -> String {
@@ -657,6 +724,48 @@ mod tests {
     fn test_extract_items_none() {
         let val = json!({"status": "ok"});
         assert!(extract_items(&val).is_none());
+    }
+
+    #[test]
+    fn test_extract_items_prefers_items_over_metadata_arrays() {
+        // Calendar events.list: defaultReminders sorts before items.
+        let val = json!({
+            "kind": "calendar#events",
+            "defaultReminders": [{"method": "popup", "minutes": 10}],
+            "items": [{"id": "evt1", "summary": "Standup"}],
+        });
+        let (key, _) = extract_items(&val).unwrap();
+        assert_eq!(key, "items");
+        let table = format_value(&val, &OutputFormat::Table);
+        assert!(table.contains("Standup"), "{table}");
+        assert!(!table.contains("popup"), "{table}");
+        let csv = format_value(&val, &OutputFormat::Csv);
+        assert!(csv.contains("Standup"), "{csv}");
+
+        // No events: show an empty list, not the reminders.
+        let empty = json!({
+            "defaultReminders": [{"method": "popup", "minutes": 10}],
+            "items": [],
+        });
+        let (key, items) = extract_items(&empty).unwrap();
+        assert_eq!(key, "items");
+        assert!(items.is_empty());
+    }
+
+    #[test]
+    fn test_extract_items_known_list_field_and_largest_object_array() {
+        let val = json!({
+            "attachments": [{"name": "a"}, {"name": "b"}, {"name": "c"}],
+            "messages": [{"id": "m1"}],
+        });
+        assert_eq!(extract_items(&val).unwrap().0, "messages");
+
+        let val = json!({
+            "aliases": ["x", "y", "z"],
+            "defaultReminders": [{"method": "popup"}],
+            "entries": [{"id": "1"}, {"id": "2"}],
+        });
+        assert_eq!(extract_items(&val).unwrap().0, "entries");
     }
 
     // --- YAML block-scalar regression tests ---

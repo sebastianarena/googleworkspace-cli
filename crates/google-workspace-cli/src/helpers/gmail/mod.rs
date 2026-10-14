@@ -663,15 +663,32 @@ fn profile_scope_tip(using_env_token: bool) -> &'static str {
 /// addresses unchanged (without display name enrichment), or `Ok(None)` if
 /// `from` was not provided.
 ///
-/// Note: this resolves the *sender identity* for the From header only. Callers
-/// that need the authenticated user's *primary* email (e.g. reply-all self-dedup)
-/// should fetch it separately via `/users/me/profile`, since the default send-as
-/// alias may differ from the primary address.
+/// Callers that also need the account's own addresses (e.g. reply-all
+/// self-dedup) should use `resolve_sender_and_identities`.
 pub(super) async fn resolve_sender(
     client: &reqwest::Client,
     token: &str,
     from: Option<&[Mailbox]>,
 ) -> Result<Option<Vec<Mailbox>>, GwsError> {
+    Ok(resolve_sender_and_identities(client, token, from)
+        .await?
+        .from)
+}
+
+/// The resolved From header plus every send-as address of the account.
+pub(super) struct ResolvedSender {
+    pub from: Option<Vec<Mailbox>>,
+    /// Empty when the send-as list could not be fetched.
+    pub own_emails: Vec<String>,
+}
+
+/// Like `resolve_sender`, but also returns the send-as addresses, so callers
+/// that need them (reply-all exclusion) reuse the same API call.
+pub(super) async fn resolve_sender_and_identities(
+    client: &reqwest::Client,
+    token: &str,
+    from: Option<&[Mailbox]>,
+) -> Result<ResolvedSender, GwsError> {
     let identities = match fetch_send_as_identities(client, token).await {
         Ok(ids) => ids,
         Err(e) => {
@@ -684,7 +701,10 @@ pub(super) async fn resolve_sender(
                 "Note: could not fetch send-as settings ({}); {hint}",
                 sanitize_for_terminal(&e.to_string())
             );
-            return Ok(from.map(|addrs| addrs.to_vec()));
+            return Ok(ResolvedSender {
+                from: from.map(|addrs| addrs.to_vec()),
+                own_emails: Vec::new(),
+            });
         }
     };
 
@@ -739,7 +759,10 @@ pub(super) async fn resolve_sender(
         }
     }
 
-    Ok(result)
+    Ok(ResolvedSender {
+        from: result,
+        own_emails: identities.into_iter().map(|id| id.mailbox.email).collect(),
+    })
 }
 
 /// Fetch the authenticated user's display name from Google's OAuth userinfo endpoint.

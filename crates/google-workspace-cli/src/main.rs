@@ -59,6 +59,16 @@ async fn main() {
     }
 }
 
+/// Build the command tree for one service.
+///
+/// Clap only sees the service-specific subcommand tree after the service name
+/// is stripped from argv, so teach it the full invocation for help/usage
+/// rendering. Otherwise nested help text for commands such as
+/// `gws sheets spreadsheets --help` incorrectly starts at `gws spreadsheets`.
+fn service_cli(doc: &discovery::RestDescription, service_arg: &str) -> clap::Command {
+    commands::build_cli(doc).bin_name(format!("gws {service_arg}"))
+}
+
 async fn run() -> Result<(), GwsError> {
     let args: Vec<String> = std::env::args().collect();
 
@@ -156,7 +166,7 @@ async fn run() -> Result<(), GwsError> {
     };
 
     // Build the dynamic command tree (all commands shown regardless of auth state)
-    let cli = commands::build_cli(&doc);
+    let cli = service_cli(&doc, &first_arg);
 
     // Re-parse args (skip argv[0] which is the binary, and argv[1] which is the service name)
     // Filter out --api-version and its value
@@ -524,6 +534,39 @@ fn is_version_flag(arg: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_service_cli_help_usage_includes_service_name() {
+        use std::collections::HashMap;
+        let mut methods = HashMap::new();
+        methods.insert(
+            "list".to_string(),
+            discovery::RestMethod {
+                http_method: "GET".to_string(),
+                path: "files".to_string(),
+                ..Default::default()
+            },
+        );
+        let mut resources = HashMap::new();
+        resources.insert(
+            "files".to_string(),
+            discovery::RestResource {
+                methods,
+                resources: HashMap::new(),
+            },
+        );
+        let doc = discovery::RestDescription {
+            name: "drive".to_string(),
+            resources,
+            ..Default::default()
+        };
+
+        let err = service_cli(&doc, "drive")
+            .try_get_matches_from(["gws", "files", "--help"])
+            .unwrap_err();
+        let help = err.render().to_string();
+        assert!(help.contains("Usage: gws drive files"), "{help}");
+    }
 
     #[test]
     fn test_parse_pagination_config_defaults() {

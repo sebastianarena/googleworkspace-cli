@@ -194,6 +194,8 @@ async fn build_http_request(
 
     let mut all_query_params = input.query_params.clone();
     if let Some(pt) = page_token {
+        // A pageToken from --params only applies to the first page.
+        all_query_params.retain(|(k, _)| k != "pageToken");
         all_query_params.push(("pageToken".to_string(), pt.to_string()));
     }
     if !all_query_params.is_empty() {
@@ -2461,4 +2463,47 @@ async fn test_get_does_not_set_content_length_zero() {
         built.headers().get("Content-Length").is_none(),
         "GET with no body should not have Content-Length header"
     );
+}
+
+#[tokio::test]
+async fn test_page_token_replaces_user_supplied_page_token() {
+    let client = reqwest::Client::new();
+    let method = RestMethod {
+        http_method: "GET".to_string(),
+        path: "files".to_string(),
+        ..Default::default()
+    };
+    let input = ExecutionInput {
+        full_url: "https://example.com/files".to_string(),
+        body: None,
+        params: Map::new(),
+        query_params: vec![
+            ("pageSize".to_string(), "10".to_string()),
+            ("pageToken".to_string(), "user-token".to_string()),
+        ],
+        is_upload: false,
+    };
+
+    let request = build_http_request(
+        &client,
+        &method,
+        &input,
+        None,
+        &AuthMethod::None,
+        Some("next-token"),
+        1,
+        &None,
+    )
+    .await
+    .unwrap();
+
+    let built = request.build().unwrap();
+    let tokens: Vec<String> = built
+        .url()
+        .query_pairs()
+        .filter(|(k, _)| k == "pageToken")
+        .map(|(_, v)| v.into_owned())
+        .collect();
+    assert_eq!(tokens, vec!["next-token".to_string()]);
+    assert!(built.url().query().unwrap().contains("pageSize=10"));
 }
